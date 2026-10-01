@@ -1,146 +1,320 @@
 # Stealth Box
 
-Work in your usual terminal and tmux on a remote VM. Choose where project
-commands run: the VM or your Mac. Written in Go, with no Go dependencies.
+**Привычный терминал. tmux и агенты на ВМ. Docker — на ВМ или твоём Mac.**
 
-This is an initial CLI, not a macOS GUI or an automatic VM provisioner.
-SSH, tmux, rsync and Docker remain normal system tools.
+Stealth Box открывает рабочие сессии, подключает исполнителя на Mac и даёт агенту
+MCP-инструменты для команд. Написан на Go. После первой настройки — `stealthbox`.
 
-## Install
+![Меню, отрисованное из реального вывода TUI](docs/assets/tui.svg)
 
-Go 1.24 or newer:
+## Что ты увидишь
+
+```text
+Твой терминал на Mac
+┌─────────────────────────────────────────────────────────────────────┐
+│ agent-hub · codex · mac  1 │ pagent · codex · vm  2 │ claude · vm  3 │
+├─────────────────────────────────────────────────────────────────────┤
+│ › Проверь изменения и запусти тесты.                                │
+│                                                                   │
+│ • Прогон на Mac: код с ВМ → отдельный каталог → Docker → результат. │
+│                                                                   │
+│ › Следующий запрос…                                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Это иллюстрация. **tmux, агент, Git и основной код действительно работают на ВМ.**
+Mac отображает терминал и при необходимости выполняет прогоны. Интерфейсы Codex
+и Claude остаются родными.
+
+```mermaid
+flowchart LR
+  subgraph MAC[Твой Mac]
+    T[Привычный терминал]
+    UI[TUI Stealth Box]
+    B[Фоновый исполнитель]
+    D[Docker Desktop]
+    UI --> T
+    B --> D
+  end
+  subgraph VM[Твоя ВМ]
+    M[tmux: окна и панели]
+    C[Codex / Claude]
+    G[Код и Git]
+    S[Приватный Unix socket]
+    M --> C
+    C --> G
+    C --> S
+  end
+  T -->|SSH: экран и клавиатура| M
+  B -->|Обратный SSH-туннель| S
+  S -->|Команды и снимок файлов| B
+```
+
+## Быстрый старт
+
+### 1. Установи на Mac
 
 ```sh
 go install github.com/mcoder33/stealthbox/cmd/stealthbox@latest
-# Or from this checkout:
-go build -o bin/stealthbox ./cmd/stealthbox
 ```
 
-## First connection
+Нужен Go 1.24+. Добавь `$(go env GOPATH)/bin` в `PATH`. Без Go скачай бинарник
+своей платформы из [Releases](https://github.com/mcoder33/stealthbox/releases/latest),
+проверь по `checksums.txt`, сделай исполняемым и помести в свой `PATH`.
+Поддерживаются **macOS/Linux, ARM64/AMD64**; Windows пока не поддерживается.
 
-Configure an SSH alias such as `dev-vm` in `~/.ssh/config`. Use your local
-ssh-agent/keychain. Stealth Box does not store SSH passwords or private keys.
-Verify the host key and test `ssh dev-vm` before using the launcher.
+### 2. Подготовь ВМ
+
+На ВМ нужны SSH, tmux, проект и установленный/авторизованный агент. Stealth Box
+не копирует учётные данные Codex/Claude и не устанавливает Docker или агентов.
+
+Пример `~/.ssh/config` на Mac:
+
+```sshconfig
+Host dev-vm
+    HostName YOUR_VM_IP
+    User developer
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+```
+
+Сначала проверь `ssh dev-vm` и ключ сервера. Для автоматических подключений ключ
+должен быть доступен через ssh-agent/keychain. Программа не хранит SSH-пароли,
+не отключает проверку ключа сервера и не включает agent forwarding.
+
+### 3. Настрой через TUI
 
 ```sh
-stealthbox init
-# Edit ~/.config/stealthbox/config.json with your own paths and aliases.
-stealthbox doctor --project example --runner vm
-stealthbox open --project example --session tmux --runner vm -- codex
+stealthbox
 ```
 
-`open` uses the **current terminal**, opening an SSH session in place. Omit
-`-- codex` to start a shell. `--session shell` bypasses tmux. Separate default
-tmux sessions are used for each project and runner. An existing tmux session
-keeps its original process and environment when reattached.
+| Пункт | Настройки |
+|---|---|
+| **VM and workspace** | SSH-алиас и имя рабочего tmux |
+| **Projects** | Путь проекта на ВМ, отдельный каталог Mac, агент и исполнитель по умолчанию |
+| **Mac runner** | Мост, прямые команды, таймаут; запуск/остановка/статус моста |
+| **Agents** | Команды запуска Codex, Claude, оболочки или своего агента |
+| **Import current tmux style** | Эффективные опции и привязки локального tmux |
+| **Deploy or update on VM** | Установка бинарника и конфигурации |
+| **Doctor** | Проверки SSH, tmux, агентов, каталогов, Docker и моста |
+| **Connect** | Проект → агент → исполнитель → имя экземпляра |
 
-Example configuration on the Mac:
+**↑/↓ или j/k** — навигация, **Enter** — выбор, **q/Esc** — назад.
+Пустой ответ в редакторе поля сохраняет прежнее значение. Для прогонов на Mac
+включи **Mac bridge**. **Direct Mac commands** дополнительно включает `mac_exec`.
 
-```json
-{
-  "projects": {
-    "example": {
-      "source": {
-        "host": "dev-vm",
-        "path": "/home/developer/projects/example"
-      },
-      "runners": {
-        "vm": {
-          "host": "dev-vm",
-          "path": "/home/developer/projects/example"
-        },
-        "mac": {
-          "path": "/Users/developer/.local/share/stealthbox/runners/example"
-        }
-      }
-    }
-  }
-}
-```
+### 4. Подключись
 
-All paths must be absolute. `host` is an SSH config alias; omitting it means
-this machine. Paths must refer to the machine selected by `host`.
-
-## Run commands
-
-From the Mac:
+Открой привычный терминал **вне локального tmux**, чтобы не вкладывать tmux в tmux:
 
 ```sh
-stealthbox run --project example --runner vm -- docker compose run --rm test
-stealthbox run --project example --runner mac -- docker compose run --rm test
-# Review every planned command without connecting or writing:
-stealthbox run --project example --runner mac --dry-run -- docker compose run --rm test
+stealthbox connect --project agent-hub --agent codex --runner mac
 ```
 
-To run the same commands **inside Codex/tmux on the VM**, install Stealth Box
-there too and create its configuration. On the VM, `source` and the `vm`
-runner omit `host`; the `mac` runner uses an SSH alias reaching your Mac.
-For example:
+Первое подключение определяет платформу/HOME ВМ, устанавливает Stealth Box,
+отправляет конфигурацию, запускает фоновый мост Mac и открывает нужное окно tmux.
+Обычные подключения используют установленный бинарник; обновление — `setup`.
+Для установки берётся проверенный по SHA-256 бинарник релиза. Из checkout можно
+собрать его Go, а для офлайн-установки указать `--binary`.
 
-```json
-{
-  "projects": {
-    "example": {
-      "source": {"path": "/home/developer/projects/example"},
-      "runners": {
-        "vm": {"path": "/home/developer/projects/example"},
-        "mac": {
-          "host": "mac-runner",
-          "path": "/Users/developer/.local/share/stealthbox/runners/example"
-        }
-      }
-    }
-  }
-}
+## Несколько вкладок и агентов
+
+```text
+stealthbox ← одна рабочая tmux-сессия на ВМ
+├── agent-hub-codex-mac-main
+├── pagent-codex-vm-main
+├── agent-hub-claude-vm-review
+└── agent-hub-codex-mac-second
 ```
 
-The VM needs an authenticated route to `mac-runner`, for example private
-network access and macOS Remote Login. This version does not configure the
-network or enable Remote Login. Do not expose Docker's API to the Internet.
+```sh
+# Второй экземпляр того же агента
+stealthbox connect --project agent-hub --agent codex --runner mac --slot second
+# Другой агент в отдельном окне
+stealthbox connect --project agent-hub --agent claude --runner vm --slot review
+# Обычная консоль без tmux
+stealthbox open --project agent-hub --agent shell --session shell
+# Аргументы агента
+stealthbox connect --project agent-hub --agent codex -- resume --last
+```
 
-`open` sets `STEALTHBOX_PROJECT` and `STEALTHBOX_RUNNER` for the new session,
-so the VM can use:
+Окно определяется проектом, агентом, исполнителем и `slot`. Дополнительные
+аргументы добавляют короткий хеш. Повторное подключение возвращает в существующий
+процесс, а не заменяет его. Для новых настроек агента заверши старый процесс или
+используй новый `slot`. Окно можно добавить из самой ВМ:
+
+```sh
+stealthbox workspace --project pagent --agent codex --runner vm --no-attach
+```
+
+tmux использует отдельный socket `-L stealthbox`; остальные сессии не меняются.
+
+### Твоё оформление
+
+Оставь обычный локальный tmux работающим и выполни `stealthbox theme` или выбери
+импорт в TUI. Тема отправится на ВМ при следующем setup/подключении. Шрифты и
+базовая палитра остаются настройками твоего терминала Mac.
+
+Опции и привязки tmux экспортируются, но локальные `run-shell`-привязки,
+плагинные `@`-опции и установка плагинов автоматически не переносятся. Плагины,
+скрипты статуса и совместимую версию tmux нужно подготовить на ВМ отдельно.
+
+## Docker и командный доступ к Mac
+
+При запуске Codex/Claude получают временную MCP-конфигурацию. Постоянные настройки
+агентов не переписываются; их собственные правила доверия/подтверждений сохраняются.
+
+| Инструмент | Что делает |
+|---|---|
+| `runner_run` | Команда на выбранном исполнителе; для Mac сначала передаётся код |
+| `vm_exec` | Явная команда на ВМ без синхронизации |
+| `mac_exec` | Явная команда на Mac без замены файлов; при включённом `allow_exec` |
+
+Агент получает описание окружения и правило использовать `runner_run` для Docker
+и тестов. Произвольные `docker ...` в оболочке **не перехватываются**: они работают
+там, где находится оболочка. Своим агентам подключай `stealthbox mcp` как stdio
+MCP-сервер или добавь правило использовать CLI в инструкции проекта.
+
+```mermaid
+sequenceDiagram
+  participant A as Агент на ВМ
+  participant S as Stealth Box
+  participant M as Исполнитель Mac
+  participant D as Docker Mac
+  A->>S: runner_run / stealthbox run
+  S->>M: Снимок незакоммиченного кода
+  M->>M: Подготовить отдельный каталог
+  M->>D: docker compose run --rm test
+  D-->>M: stdout / stderr / статус
+  M-->>A: Потоковый вывод и результат
+```
+
+В сессии на ВМ переменные проекта/исполнителя уже заданы:
 
 ```sh
 stealthbox run -- docker compose run --rm test
+stealthbox run --runner vm -- docker compose run --rm test
+stealthbox exec --on mac -- uname -s
+stealthbox exec --on vm -- git status --short
+# Скачать артефакт с Mac на ВМ; output не должен существовать
+stealthbox fetch --file reports/result.json --output ./result.json
 ```
 
-Configure a project test script or agent instructions to call this command.
-Arbitrary Docker commands are not intercepted. `STEALTHBOX_CONFIG` selects
-a config path on the machine where the CLI runs; it is not forwarded by SSH.
+### Файлы и состояние
 
-## File synchronization and limits
+```text
+ВМ: основной проект                  Mac: отдельная копия для прогонов
+├── src/              ──────────→    ├── src/
+├── compose.yaml      ──────────→    ├── compose.yaml
+├── .git/             исключён       ├── .stealthbox-runner
+└── .env              исключён       └── .env ← настраивается отдельно на Mac
+```
 
-- Code on the source is authoritative, including uncommitted files.
-- A different runner gets an rsync copy before execution. Its path must be
-  a **dedicated disposable directory**, initially empty. The CLI marks it
-  with `.stealthbox-runner` and refuses an unmarked nonempty directory.
-- Deleted source files are removed from the runner. Do not edit the runner
-  copy or run concurrent synchronizations into the same directory.
-- `.git`, `.env`, `.env.*`, `vendor`, `node_modules` and `.serena` are excluded.
-  Provision runner secrets/dependencies separately. These exclusions are not
-  comprehensive secret detection: review your project's files before sync.
-- Excluded runner files survive synchronization. Other generated files in
-  the runner directory may be removed on the next sync. Prefer Docker volumes
-  for persistent data and collect artifacts before the next run.
-- SSH and rsync must work without interactive password prompts. The bundled macOS
-  openrsync is supported. Remote paths may contain only letters, digits, slash,
-  dot, underscore and hyphen; local paths may include spaces.
-- Synchronization supports local-to-remote, remote-to-local and local-to-local;
-  two remote endpoints require running the CLI on one of those machines.
-- Containers, volumes and databases stay on their runner. No state migration
-  or automatic fallback. Mac ARM and VM AMD64 images may behave differently.
-- tmux survives SSH disconnection, not a stopped/preempted VM. Restart the VM
-  and resume Codex separately; Stealth Box does not restart VMs yet.
-- Command output is streamed to the terminal and nonzero exit codes propagate.
-  Artifact download, GUI terminal launching and automatic tunnels are future work.
+- Каталог Mac должен быть **отдельным, изначально пустым**. Непустой каталог без
+  метки не заменяется. Основной код редактируется на ВМ.
+- Новый снимок заменяет код и удаляет устаревшие файлы. `.git`, `.env`, `.env.*`,
+  `vendor`, `node_modules`, `.serena` исключены; существующие исключённые файлы
+  исполнителя сохраняются. Это не универсальное обнаружение секретов.
+- Символические ссылки и специальные файлы исходника не передаются. Архивы с
+  выходом за каталог, ссылками и превышением лимита отклоняются.
+- Второй одновременный прогон того же проекта получает `409 runner busy`.
+  Для параллельных прогонов нужны разные каталоги/проекты.
+- Артефакты скачивай до следующей синхронизации. Базы и Docker volumes остаются
+  на исполнителе и не мигрируют при переключении. ARM64/AMD64 могут отличаться;
+  при необходимости задавай платформу образов в Compose.
 
-## Development
+### Соединение с Mac
+
+```text
+Mac сам устанавливает исходящее SSH-соединение с ВМ
+          └── -R remote/mac.sock:local/mac.sock
+                    │                    │
+             Агент на ВМ          Исполнитель на Mac
+```
+
+На Mac не нужен SSH-сервер, публичный IP или открытый HTTP/Docker-порт. Используются
+Unix sockets, SSH и токен в конфигурациях с правами `0600`. На SSH-сервере ВМ нужно
+разрешить Unix-socket forwarding.
+
+Мост сохраняется после выхода из tmux:
 
 ```sh
-go test -race ./...
-go vet ./...
-go build ./cmd/stealthbox
+stealthbox bridge-status
+stealthbox bridge-stop
+stealthbox bridge-start
+stealthbox bridge           # foreground для диагностики
 ```
+
+Лог: `~/.config/stealthbox/mac.sock.log`. Новые настройки применяются через
+**Start / apply** в TUI или новое подключение. Перезапуск/остановка моста прерывает
+команды Mac. После перезагрузки Mac нужно запустить программу снова.
+
+**Команды имеют права пользователя Mac. Исполнитель не является security sandbox.**
+Рабочий каталог не ограничивает файловые/сетевые права самой команды. `allow_exec`
+управляет прямым инструментом; `runner_run` тоже исполняет произвольный код проекта.
+Для изоляции используй отдельного пользователя или Linux-ВМ с Docker.
+Управление окнами macOS, мышью, экраном и браузером здесь не реализовано.
+
+## Отключения и порты
+
+| Событие | Результат |
+|---|---|
+| Detach/закрытие терминала | Процессы ВМ и мост Mac остаются |
+| Обрыв SSH | Терминал/мост переподключаются; команды автоматически не повторяются |
+| Mac уснул/потерял сеть | Команды Mac недоступны; прерванный прогон проверяй вручную |
+| ВМ остановлена/прервана | Процессы завершены; после старта нужна новая сессия/resume |
+
+В `workspace` конфигурации можно указать:
+
+```json
+"forwards": [{"local": 8080, "remote": 8080}]
+```
+
+При подключении сервис ВМ станет доступен на Mac как `http://127.0.0.1:8080`.
+Docker-порты Mac уже находятся на Mac. Порты контейнеров автоматически не обнаруживаются.
+
+## CLI без TUI
+
+```sh
+stealthbox init --host dev-vm --enable-mac --allow-mac-exec
+stealthbox project --project example \
+  --path /home/developer/projects/example \
+  --mac-path /Users/developer/.local/share/stealthbox/runners/example \
+  --agent codex --runner mac
+stealthbox theme
+stealthbox setup
+stealthbox connect --project example
+```
+
+Все флаги идут до `--` и аргументов команды. `--dry-run` не подключается и не пишет
+файлы. `config` показывает настройки с замаскированным токеном, `config --edit`
+открывает `$EDITOR`. Профиль — `~/.config/stealthbox/config.json`; альтернативы:
+`--config` или `STEALTHBOX_CONFIG`. Один профиль соответствует одной ВМ.
+`STEALTHBOX_SSH_CONFIG` задаёт отдельный файл SSH-алиасов для автоматизации/тестов.
+
+## Проверка
+
+```sh
+stealthbox doctor
+stealthbox bridge-status
+make test                         # race detector + go vet
+python3 tests/integration/tui.py   # реальный TUI через pseudo-terminal
+make e2e                          # Docker, Compose, SSH, Python 3, Go
+make release VERSION=v0.2.0
+```
+
+E2E использует временный Linux-контейнер с SSH/tmux и отдельный тестовый ключ.
+Проверяются установка, туннель, настоящий локальный Docker, окна агентов, тема,
+переподключение, мост после detach и скачивание артефакта. Ресурсы убираются после
+теста. Агенты в E2E заменены оболочками: подписки и модельные вызовы не нужны.
+CI проверяет Linux/macOS; E2E запускается на Linux. Живые учётные записи агентов
+и конкретная облачная ВМ проверяются отдельно после настройки доступа.
+
+При аварийном завершении может остаться socket: сначала убедись, что его владелец
+не работает, и удали только этот устаревший socket. Локальные sockets программа
+вслепую не удаляет. Не направляй отмеченный каталог исполнителя на личные данные.
+
+В `docs/presentation/` сохранены презентация и макет терминала этапа проектирования.
+Они имитируют работу; актуальные возможности описаны выше.
 
 MIT licensed.

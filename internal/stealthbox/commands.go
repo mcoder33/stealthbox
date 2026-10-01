@@ -13,16 +13,22 @@ import (
 )
 
 type Endpoint struct {
-	Host string `json:"host,omitempty"`
-	Path string `json:"path"`
+	Host   string `json:"host,omitempty"`
+	Path   string `json:"path"`
+	Bridge bool   `json:"bridge,omitempty"`
 }
 type Project struct {
 	Source  Endpoint            `json:"source"`
 	Runners map[string]Endpoint `json:"runners"`
 	Session string              `json:"session,omitempty"`
+	Agent   string              `json:"agent,omitempty"`
+	Runner  string              `json:"runner,omitempty"`
 }
 type Config struct {
-	Projects map[string]Project `json:"projects"`
+	Projects  map[string]Project  `json:"projects"`
+	Workspace WorkspaceConfig     `json:"workspace"`
+	Bridge    BridgeConfig        `json:"bridge"`
+	Agents    map[string][]string `json:"agents,omitempty"`
 }
 type Command struct {
 	Program string
@@ -63,6 +69,25 @@ func Load(path string) (Config, error) {
 	if err = json.Unmarshal(b, &c); err != nil {
 		return c, err
 	}
+	if c.Projects == nil {
+		c.Projects = map[string]Project{}
+	}
+	defaults, e := DefaultConfig()
+	if e != nil {
+		return c, e
+	}
+	if c.Agents == nil {
+		c.Agents = defaults.Agents
+	}
+	if c.Bridge.Socket == "" {
+		c.Bridge.Socket = defaults.Bridge.Socket
+	}
+	if c.Bridge.Token == "" {
+		c.Bridge.Token = defaults.Bridge.Token
+	}
+	if c.Workspace.Name == "" {
+		c.Workspace.Name = defaults.Workspace.Name
+	}
 	for name, p := range c.Projects {
 		if !nameRE.MatchString(name) {
 			return c, fmt.Errorf("invalid project name %q", name)
@@ -79,6 +104,9 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
+	if err := c.Validate(); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 func At(e Endpoint, script string, tty bool) Command {
@@ -86,6 +114,9 @@ func At(e Endpoint, script string, tty bool) Command {
 		return Command{"sh", []string{"-c", script}}
 	}
 	args := []string{"-o", "BatchMode=yes"}
+	if config := os.Getenv("STEALTHBOX_SSH_CONFIG"); config != "" {
+		args = append(args, "-F", config)
+	}
 	if tty {
 		args = append(args, "-t")
 	}
@@ -109,7 +140,14 @@ func Open(p Project, name, session, runner string, command []string) (Command, e
 	} else {
 		s := p.Session
 		if s == "" {
-			s = "stealthbox-" + name + "-" + runner
+			agent := "shell"
+			if len(command) > 0 {
+				agent = filepath.Base(command[0])
+				if !nameRE.MatchString(agent) {
+					agent = "custom"
+				}
+			}
+			s = "stealthbox-" + name + "-" + agent + "-" + runner
 		}
 		if !nameRE.MatchString(s) {
 			return Command{}, fmt.Errorf("invalid tmux session name")

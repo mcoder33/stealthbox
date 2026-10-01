@@ -66,7 +66,7 @@ func TestOpen(t *testing.T) {
 		t.Fatal(e)
 	}
 	s := strings.Join(c.Args, " ")
-	if !strings.Contains(s, "stealthbox-example-mac") || !strings.Contains(s, "STEALTHBOX_RUNNER") {
+	if !strings.Contains(s, "stealthbox-example-codex-mac") || !strings.Contains(s, "STEALTHBOX_RUNNER") {
 		t.Fatal(s)
 	}
 }
