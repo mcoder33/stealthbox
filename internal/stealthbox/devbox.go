@@ -39,11 +39,15 @@ func shellArgs(args []string) string {
 }
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+var remotePathRE = regexp.MustCompile(`^/[a-zA-Z0-9_./-]+$`)
 var hostRE = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$`)
 
 func ValidateEndpoint(e Endpoint) error {
 	if !filepath.IsAbs(e.Path) || filepath.Clean(e.Path) == "/" || strings.ContainsAny(e.Path, "\n\r\x00") {
 		return fmt.Errorf("path must be absolute and must not be root: %q", e.Path)
+	}
+	if e.Host != "" && !remotePathRE.MatchString(e.Path) {
+		return fmt.Errorf("remote paths must use letters, digits, slash, dot, underscore or hyphen: %q", e.Path)
 	}
 	if e.Host != "" && !hostRE.MatchString(e.Host) {
 		return fmt.Errorf("use a safe SSH config alias for host: %q", e.Host)
@@ -145,7 +149,7 @@ func PlanRun(p Project, runner string, args []string) ([]Command, error) {
 			return nil, fmt.Errorf("source and runner directories must not overlap")
 		}
 		cmds = append(cmds, At(dst, "mkdir -p "+Quote(dst.Path)+" && cd "+Quote(dst.Path)+" && { test -f .stealthbox-runner || test -z \"$(ls -A)\"; } && touch .stealthbox-runner", false))
-		cmds = append(cmds, Command{"rsync", []string{"-az", "--delete-delay", "--protect-args", "--exclude=.stealthbox-runner", "--exclude=.git", "--exclude=.env", "--exclude=.env.*", "--exclude=node_modules/", "--exclude=vendor/", "--exclude=.serena/", "-e", "ssh -o BatchMode=yes", "--", location(p.Source), location(dst)}})
+		cmds = append(cmds, Command{"rsync", []string{"-az", "--delete-delay", "--exclude=.stealthbox-runner", "--exclude=.git", "--exclude=.env", "--exclude=.env.*", "--exclude=node_modules/", "--exclude=vendor/", "--exclude=.serena/", "-e", "ssh -o BatchMode=yes", "--", location(p.Source), location(dst)}})
 	}
 	cmds = append(cmds, At(dst, "cd "+Quote(dst.Path)+" && "+shellArgs(args), false))
 	return cmds, nil

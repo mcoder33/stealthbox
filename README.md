@@ -123,9 +123,9 @@ a config path on the machine where the CLI runs; it is not forwarded by SSH.
 - Excluded runner files survive synchronization. Other generated files in
   the runner directory may be removed on the next sync. Prefer Docker volumes
   for persistent data and collect artifacts before the next run.
-- SSH and rsync must work without interactive password prompts. Older bundled
-  macOS rsync versions may lack `--protect-args`; install a current rsync and
-  put it on PATH on both hosts.
+- SSH and rsync must work without interactive password prompts. The bundled macOS
+  openrsync is supported. Remote paths may contain only letters, digits, slash,
+  dot, underscore and hyphen; local paths may include spaces.
 - Synchronization supports local-to-remote, remote-to-local and local-to-local;
   two remote endpoints require running the CLI on one of those machines.
 - Containers, volumes and databases stay on their runner. No state migration

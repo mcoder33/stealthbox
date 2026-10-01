@@ -107,3 +107,50 @@ func TestRejectOverlappingDirectories(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalSyncDeletesStaleAndPreservesSecrets(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync unavailable")
+	}
+	src := t.TempDir() + "/source with spaces"
+	dst := t.TempDir() + "/runner with spaces"
+	if err := os.Mkdir(src, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src+"/code", []byte("uncommitted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src+"/.env", []byte("source-secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := Project{Source: Endpoint{Path: src}, Runners: map[string]Endpoint{"mac": {Path: dst}}}
+	execute := func() {
+		t.Helper()
+		cmds, e := PlanRun(p, "mac", []string{"true"})
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, c := range cmds {
+			if out, e := exec.Command(c.Program, c.Args...).CombinedOutput(); e != nil {
+				t.Fatalf("%s: %s %v", c.Program, out, e)
+			}
+		}
+	}
+	execute()
+	if _, e := os.Stat(dst + "/.env"); !os.IsNotExist(e) {
+		t.Fatal("source secret copied")
+	}
+	if e := os.WriteFile(dst+"/.env", []byte("runner-secret"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.Remove(src + "/code"); e != nil {
+		t.Fatal(e)
+	}
+	execute()
+	if _, e := os.Stat(dst + "/code"); !os.IsNotExist(e) {
+		t.Fatal("deleted source file retained")
+	}
+	if b, e := os.ReadFile(dst + "/.env"); e != nil || string(b) != "runner-secret" {
+		t.Fatal("runner secret removed")
+	}
+}
