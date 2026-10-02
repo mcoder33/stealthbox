@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -60,9 +59,7 @@ func TestBridgeShutdownKillsCommandGroup(t *testing.T) {
 	case <-time.After(7 * time.Second):
 		t.Fatal("bridge did not finish")
 	}
-	if e := syscall.Kill(-pid, 0); e == nil {
-		t.Fatal("command group survived shutdown")
-	}
+	waitForTerminatedProcessGroup(t, pid)
 	select {
 	case <-commandDone:
 	case <-time.After(time.Second):
