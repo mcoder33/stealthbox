@@ -21,6 +21,7 @@ var linuxARM64 []byte
 var version = "dev"
 
 func main() {
+	version = buildVersion()
 	args := os.Args[1:]
 	if len(args) == 1 && (args[0] == "--version" || args[0] == "version") {
 		fmt.Println("stealthbox", version)

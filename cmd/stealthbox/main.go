@@ -52,7 +52,7 @@ func configDefault() (string, error) {
 	return filepath.Join(home, ".config", "stealthbox", "config.json"), err
 }
 func run(ctx context.Context, args []string) error {
-	stealthbox.BuildVersion = version
+	stealthbox.BuildVersion = buildVersion()
 	def, err := configDefault()
 	if err != nil {
 		return err
@@ -70,7 +70,7 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	}
 	if args[0] == "--version" || args[0] == "version" {
-		fmt.Println("stealthbox", version)
+		fmt.Println("stealthbox", stealthbox.BuildVersion)
 		return nil
 	}
 	if args[0] == "handshake" {

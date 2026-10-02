@@ -507,7 +507,7 @@ stealthbox connect --project example
 make test                         # Go tests + race detector + go vet
 python3 tests/integration/tui.py   # настоящий TUI через pseudo-terminal
 make e2e                          # временный Linux SSH/tmux + локальный Docker
-make release VERSION=v0.4.0        # шесть бинарников и checksums.txt
+make release VERSION=v0.4.1        # шесть бинарников и checksums.txt
 ```
 
 **v0.4.0:** проверены запуск без аргументов, сохранение активной панели и процесса,
