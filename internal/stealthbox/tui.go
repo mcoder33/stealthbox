@@ -3,16 +3,48 @@ package stealthbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
+
+// Go's asynchronous preemption and terminal resize signals may interrupt poll.
+// They are not user cancellation or terminal errors.
+func pollTerminal(ctx context.Context, fd int, timeout int) (int, error) {
+	deadline := time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		remaining := time.Until(deadline).Milliseconds()
+		if remaining < 0 {
+			return 0, nil
+		}
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, int(remaining)+1)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return n, err
+	}
+}
+
+func readTerminal(b []byte) (int, error) {
+	for {
+		n, err := os.Stdin.Read(b)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return n, err
+	}
+}
 
 func choose(ctx context.Context, title string, items []string, selected int) (int, error) {
 	if len(items) == 0 {
@@ -52,15 +84,14 @@ func choose(ctx context.Context, title string, items []string, selected int) (in
 		if ctx.Err() != nil {
 			return -1, ctx.Err()
 		}
-		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		n, e := unix.Poll(fds, 200)
+		n, e := pollTerminal(ctx, fd, 200)
 		if e != nil {
 			return -1, e
 		}
 		if n == 0 {
 			continue
 		}
-		if _, err = os.Stdin.Read(b); err != nil {
+		if _, err = readTerminal(b); err != nil {
 			return -1, err
 		}
 		switch b[0] {
@@ -68,21 +99,20 @@ func choose(ctx context.Context, title string, items []string, selected int) (in
 			return -1, nil
 		case 27:
 			seq := make([]byte, 2)
-			poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-			n, e := unix.Poll(poll, 60)
+			n, e := pollTerminal(ctx, fd, 60)
 			if e != nil {
 				return -1, e
 			}
 			if n == 0 {
 				return -1, nil
 			}
-			if _, err = os.Stdin.Read(seq[:1]); err != nil {
+			if _, err = readTerminal(seq[:1]); err != nil {
 				return -1, err
 			}
 			if seq[0] != '[' {
 				return -1, nil
 			}
-			if _, err = os.Stdin.Read(seq[1:]); err != nil {
+			if _, err = readTerminal(seq[1:]); err != nil {
 				return -1, err
 			}
 			if seq[1] == 'A' {
@@ -132,6 +162,10 @@ func TUI(ctx context.Context, path string) error {
 	if os.IsNotExist(err) {
 		c, err = DefaultConfig()
 		if err == nil {
+			c.Workspace.VMRoot = "~/Projects"
+			err = NormalizeLocalWorkspaceRoots(&c)
+		}
+		if err == nil {
 			err = Save(path, c)
 		}
 	}
@@ -143,7 +177,7 @@ func TUI(ctx context.Context, path string) error {
 		if c.Bridge.Enabled {
 			state = "on"
 		}
-		i, e := choose(ctx, "VM: "+c.Workspace.Host+" · Mac bridge: "+state, []string{"Connect / подключиться", "Projects / проекты", "VM and workspace / настройки ВМ", "Mac runner / доступ к Mac", "Agents / команды агентов", "Import current tmux style / оформление", "Deploy or update on VM / установка", "Doctor / диагностика", "Source import/export / перенос исходников", "Exit"}, 0)
+		i, e := choose(ctx, "VM: "+c.Workspace.Host+" · Mac bridge: "+state, []string{"Continue in tmux / продолжить работу", "Projects / проекты", "VM and workspace / настройки ВМ", "Mac runner / доступ к Mac", "Agent environment / Codex и Claude", "Import current tmux style / оформление", "Prepare or update VM / подготовка среды", "Doctor / диагностика", "Source import/export / перенос исходников", "Exit"}, 0)
 		if e != nil {
 			return e
 		}
@@ -157,70 +191,7 @@ func TUI(ctx context.Context, path string) error {
 				pauseTUI(ctx)
 				continue
 			}
-			names := Names(c)
-			labels := append([]string{}, names...)
-			if WorkspaceRootEnabled(c) {
-				names = append([]string{""}, names...)
-				labels = append([]string{"Whole Projects workspace / все проекты"}, labels...)
-			}
-			idx, e := choose(ctx, "Choose a workspace", labels, 0)
-			if e != nil {
-				return e
-			}
-			if idx < 0 {
-				continue
-			}
-			name := names[idx]
-			p := c.Projects[name]
-			agents := []string{}
-			for n := range c.Agents {
-				agents = append(agents, n)
-			}
-			if len(agents) == 0 {
-				agents = []string{"codex", "claude", "shell"}
-			}
-			sort.Strings(agents)
-			ai, e := choose(ctx, "Choose an agent", agents, 0)
-			if e != nil {
-				return e
-			}
-			if ai < 0 {
-				continue
-			}
-			runners := []string{}
-			for n := range p.Runners {
-				runners = append(runners, n)
-			}
-			sort.Strings(runners)
-			if name == "" {
-				runners = []string{"vm"}
-				if c.Bridge.Enabled {
-					runners = append(runners, "local")
-				}
-			}
-			ri, e := choose(ctx, "Docker/test runner", runners, 0)
-			if e != nil {
-				return e
-			}
-			if ri < 0 {
-				continue
-			}
-			si, e := choose(ctx, "Terminal session", []string{"tmux / несколько окон", "shell / обычная консоль"}, 0)
-			if e != nil {
-				return e
-			}
-			if si < 0 {
-				continue
-			}
-			session := "tmux"
-			if si == 1 {
-				session = "shell"
-			}
-			slot, e := prompt(ctx, "Session name (another name = another agent instance)", "main")
-			if e != nil {
-				return e
-			}
-			err = Connect(ctx, &c, path, ConnectOptions{Project: name, Agent: agents[ai], Runner: runners[ri], Slot: slot, Reconnect: true, Session: session}, os.Stdout, os.Stderr)
+			err = Connect(ctx, &c, path, ConnectOptions{Agent: "shell", Runner: WorkspaceRunner(c), Reconnect: true, Session: "tmux", Resume: true}, os.Stdout, os.Stderr)
 			if err != nil {
 				fmt.Println("Error:", err)
 			}
@@ -232,83 +203,7 @@ func TUI(ctx context.Context, path string) error {
 				pauseTUI(ctx)
 			}
 		case 2:
-			next := cloneConfig(c)
-			oldHost := next.Workspace.Host
-			oldRoot := next.Workspace.VMRoot
-			next.Workspace.Host, err = prompt(ctx, "SSH alias", c.Workspace.Host)
-			if err == nil {
-				next.Workspace.Name, err = prompt(ctx, "Workspace name", c.Workspace.Name)
-			}
-			if err == nil {
-				next.Workspace.RemoteDir, err = prompt(ctx, "Remote state directory (empty = detect HOME)", c.Workspace.RemoteDir)
-			}
-			if err == nil {
-				selected := 0
-				if WorkspaceRootEnabled(next) {
-					selected = 1
-				}
-				mode, e := choose(ctx, "Workspace mode", []string{"Configured projects only", "Whole Projects root"}, selected)
-				if e != nil {
-					return e
-				}
-				if mode < 0 {
-					continue
-				}
-				if mode == 0 {
-					next.Workspace.VMRoot = ""
-				} else {
-					next.Workspace.VMRoot, err = prompt(ctx, "Projects root on VM (~ belongs to VM)", envDefaultValue(next.Workspace.VMRoot, "~/Projects"))
-					if err == nil {
-						next.Workspace.LocalRoot, err = prompt(ctx, "Local source root (explicit import/export only)", envDefaultValue(next.Workspace.LocalRoot, "~/Projects"))
-					}
-					if err == nil {
-						next.Workspace.RunnerRoot, err = prompt(ctx, "Separate disposable local runner root", envDefaultValue(next.Workspace.RunnerRoot, "~/.local/share/stealthbox/runners"))
-					}
-					if err == nil {
-						next.Workspace.SyncTransport, err = prompt(ctx, "Runner sync: auto, rsync or archive", envDefaultValue(next.Workspace.SyncTransport, "auto"))
-					}
-					if err == nil {
-						value := 0
-						if next.Workspace.ShellIntegration {
-							value = 1
-						}
-						choice, e := choose(ctx, "Managed shell codex/claude commands", []string{"Use explicit stealthbox agent commands", "Wrap codex and claude in this shell"}, value)
-						if e != nil {
-							return e
-						}
-						if choice < 0 {
-							continue
-						}
-						next.Workspace.ShellIntegration = choice == 1
-					}
-				}
-			}
-			if err == nil {
-				if oldHost != next.Workspace.Host {
-					next.Workspace.ID = ""
-					next.Workspace.RemoteDir = ""
-					next.Bridge.RemoteSocket = ""
-					for n, p := range next.Projects {
-						if p.Source.Host == oldHost {
-							p.Source.Host = next.Workspace.Host
-							vm := p.Runners["vm"]
-							vm.Host = next.Workspace.Host
-							p.Runners["vm"] = vm
-							next.Projects[n] = p
-						}
-					}
-				}
-				if oldRoot != next.Workspace.VMRoot {
-					next.Workspace.ID = ""
-				}
-				err = NormalizeLocalWorkspaceRoots(&next)
-				if err == nil {
-					err = Save(path, next)
-				}
-			}
-			if err == nil {
-				c = next
-			} else {
+			if err = editWorkspace(ctx, &c, path); err != nil {
 				fmt.Println(err)
 				pauseTUI(ctx)
 			}
@@ -324,11 +219,7 @@ func TUI(ctx context.Context, path string) error {
 			if mi >= 3 {
 				switch mi {
 				case 3:
-					if c.Workspace.RemoteDir == "" {
-						err = Setup(ctx, &c, path, "", os.Stdout)
-					} else {
-						err = DeployConfig(ctx, c)
-					}
+					err = EnsureReady(ctx, &c, path, "", os.Stdout)
 					if err == nil {
 						err = StartBridgeService(ctx, c, path, os.Stdout)
 					}
@@ -354,6 +245,9 @@ func TUI(ctx context.Context, path string) error {
 			switch mi {
 			case 0:
 				next.Bridge.Enabled = !next.Bridge.Enabled
+				if !next.Bridge.Enabled && runnerAlias(next.Workspace.Runner) == "mac" {
+					next.Workspace.Runner = "vm"
+				}
 			case 1:
 				next.Bridge.AllowExec = !next.Bridge.AllowExec
 			case 2:
@@ -374,35 +268,12 @@ func TUI(ctx context.Context, path string) error {
 				pauseTUI(ctx)
 			}
 		case 4:
-			next := cloneConfig(c)
-			name, e := prompt(ctx, "Agent name", "codex")
-			if e != nil {
-				return e
-			}
-			current := next.Agents[name]
-			if len(current) == 0 {
-				current = []string{name}
-			}
-			raw, e := prompt(ctx, "Command as JSON argv", JSONString(current))
-			if e != nil {
-				return e
-			}
-			var argv []string
-			if e = json.Unmarshal([]byte(raw), &argv); e != nil {
-				fmt.Println(e)
-				pauseTUI(ctx)
-				continue
-			}
-			if next.Agents == nil {
-				next.Agents = map[string][]string{}
-			}
-			next.Agents[name] = argv
-			if err = Save(path, next); err == nil {
-				c = next
-			} else {
+			fmt.Println("Codex and Claude are part of the prepared environment. Start either command in any tmux window; the native CLI handles first-time sign-in.")
+			err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, remoteToolPath+`; for tool in codex claude; do command -v "$tool" || printf '%s: needs preparation\n' "$tool"; done`, false), nil, os.Stdout, os.Stderr)
+			if err != nil {
 				fmt.Println(err)
-				pauseTUI(ctx)
 			}
+			pauseTUI(ctx)
 		case 5:
 			var data []byte
 			data, err = ThemeSnapshot(ctx)
@@ -557,6 +428,54 @@ func envDefaultValue(s, d string) string {
 	return s
 }
 
+func editWorkspace(ctx context.Context, c *Config, path string) error {
+	next := cloneConfig(*c)
+	var err error
+	next.Workspace.Host, err = prompt(ctx, "SSH alias", c.Workspace.Host)
+	if err != nil {
+		return err
+	}
+	next.Workspace.VMRoot, err = prompt(ctx, "Projects on the VM", envDefaultValue(c.Workspace.VMRoot, "~/Projects"))
+	if err != nil {
+		return err
+	}
+	next.Workspace.LocalRoot, err = prompt(ctx, "Local projects (for explicit import/export)", envDefaultValue(c.Workspace.LocalRoot, "~/Projects"))
+	if err != nil {
+		return err
+	}
+	selected := 0
+	if WorkspaceRunner(*c) == "mac" {
+		selected = 1
+	}
+	i, err := choose(ctx, "Default place for Docker/tests", []string{"VM / на ВМ", "This computer / на этом компьютере"}, selected)
+	if err != nil || i < 0 {
+		return err
+	}
+	next.Workspace.Runner = []string{"vm", "local"}[i]
+	if next.Workspace.Host != c.Workspace.Host {
+		next.Workspace.ID, next.Workspace.RemoteDir, next.Bridge.RemoteSocket = "", "", ""
+		for n, p := range next.Projects {
+			if p.Source.Host == c.Workspace.Host {
+				p.Source.Host = next.Workspace.Host
+				vm := p.Runners["vm"]
+				vm.Host = next.Workspace.Host
+				p.Runners["vm"] = vm
+				next.Projects[n] = p
+			}
+		}
+	}
+	if next.Workspace.VMRoot != c.Workspace.VMRoot {
+		next.Workspace.ID = ""
+	}
+	if err = NormalizeLocalWorkspaceRoots(&next); err != nil {
+		return err
+	}
+	if err = Save(path, next); err == nil {
+		*c = next
+	}
+	return err
+}
+
 func readLine(ctx context.Context) (string, error) {
 	var b strings.Builder
 	one := make([]byte, 1)
@@ -564,15 +483,14 @@ func readLine(ctx context.Context) (string, error) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		fds := []unix.PollFd{{Fd: int32(os.Stdin.Fd()), Events: unix.POLLIN}}
-		ready, err := unix.Poll(fds, 200)
+		ready, err := pollTerminal(ctx, int(os.Stdin.Fd()), 200)
 		if err != nil {
 			return "", err
 		}
 		if ready == 0 {
 			continue
 		}
-		n, e := os.Stdin.Read(one)
+		n, e := readTerminal(one)
 		if e != nil {
 			return "", e
 		}

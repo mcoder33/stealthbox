@@ -126,7 +126,10 @@ def main():
             settings = json.loads(config.read_text())
             settings['bridge']['socket'] = str(temporary / 'mac.sock')
             settings['workspace']['id'] = 'workspace-e2e-' + container[:12]
-            settings['agents']['codex'] = ['/home/developer/mock-codex']
+            settings['workspace']['prepare'] = False
+            settings['workspace']['runner'] = 'local'
+            settings.setdefault('agents', {})['codex'] = ['/home/developer/mock-codex']
+            settings['agents']['claude'] = ['/home/developer/mock-codex']
             config.write_text(json.dumps(settings))
             os.chmod(config, 0o600)
             identity = settings['workspace']['id']
@@ -149,8 +152,8 @@ def main():
             (local_source / 'code.txt').write_text('local-source-must-stay')
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 120, 0, 0))
-            process = subprocess.Popen([str(binary), 'connect', '--config', str(config),
-                                        '--runner', 'local', '--binary', str(linux_binary)],
+            process = subprocess.Popen([str(binary), '--config', str(config),
+                                        '--binary', str(linux_binary)],
                                        stdin=slave, stdout=slave, stderr=slave, env=env,
                                        start_new_session=True)
             os.close(slave)
@@ -268,6 +271,28 @@ def main():
             args = remote('cat', '/home/developer/agent-arguments')
             assert 'STEALTHBOX_SCOPE="workspace"' in args, args
             print('PASS root tmux shell, ordinary new window, codex wrapper + workspace MCP arguments (mock launcher)', flush=True)
+            pane = remote('tmux', '-L', 'stealthbox', 'split-window', '-h', '-P', '-F', '#{pane_id}',
+                          '-t', 'stealthbox:second', '-c', f'{VM_ROOT}/b/api').strip()
+            remote('tmux', '-L', 'stealthbox', 'send-keys', '-t', pane, 'claude --fixture-third', 'Enter')
+            wait_for(lambda: '--fixture-third' in remote('cat', '/home/developer/agent-arguments'))
+            assert '--mcp-config' in remote('cat', '/home/developer/agent-arguments')
+            before = remote('tmux', '-L', 'stealthbox', 'display-message', '-p', '-t', 'stealthbox',
+                            '#{window_id}|#{pane_id}|#{pane_pid}|#{session_windows}')
+            remote('tmux', '-L', 'stealthbox', 'detach-client', '-s', 'stealthbox')
+            wait_for(lambda: (drain(), process.poll() is not None)[1])
+            assert process.returncode == 0
+            os.close(master)
+            master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 120, 0, 0))
+            process = subprocess.Popen([str(binary)], stdin=slave, stdout=slave, stderr=slave,
+                                       env=dict(env, STEALTHBOX_CONFIG=str(config)), start_new_session=True)
+            os.close(slave)
+            wait_for(lambda: (drain(), remote('tmux', '-L', 'stealthbox', 'list-clients',
+                                              '-t', 'stealthbox', '-F', '#{client_session}').strip())[1])
+            after = remote('tmux', '-L', 'stealthbox', 'display-message', '-p', '-t', 'stealthbox',
+                           '#{window_id}|#{pane_id}|#{pane_pid}|#{session_windows}')
+            assert before == after, (before, after)
+            print('PASS ordinary split pane + Claude wrapper; bare stealthbox reconnect preserves active pane/process/windows', flush=True)
             plan = temporary / 'export-plan.json'
             preview = call([str(binary), 'source', 'export', '--config', str(config), '--path', 'b/api',
                             '--plan', str(plan)], env=env)

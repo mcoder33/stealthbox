@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Drive the actual TUI through a pseudo-terminal, including persisted settings."""
-import fcntl, html, json, os, pathlib, pty, re, select, struct, subprocess, tempfile, termios, time
+import fcntl, html, json, os, pathlib, pty, re, select, signal, struct, subprocess, tempfile, termios, time
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 ANSI=re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 def run():
@@ -21,7 +21,12 @@ def run():
   def send(s):os.write(master,s.encode())
   try:
    initial=until('q/Esc back')
-   send('j\r');until('Add project');send('\r');until('Project name');send('demo\r')
+   for _ in range(100):
+    os.kill(p.pid,signal.SIGURG);time.sleep(.002)
+   send('j\r');until('Add project');send('\r');until('Project name')
+   for _ in range(100):
+    os.kill(p.pid,signal.SIGURG);time.sleep(.002)
+   send('demo\r')
    until('Absolute project path');send('/home/developer/project\r')
    until('Disposable Mac runner');send(os.path.realpath(d)+'/runner\r')
    until('Default agent');send('\r');until('Default runner');send('\r');until('VM: dev-vm')
@@ -37,7 +42,7 @@ def run():
     elements.append(f'<text x="28" y="{75+i*22}" fill="{color}">{html.escape(line)}</text>')
    height=max(460,110+len(lines)*22);svg=f'<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="{height}" viewBox="0 0 1000 {height}"><rect width="1000" height="{height}" rx="16" fill="#191a24"/><path d="M0 40H1000" stroke="#343849"/><circle cx="22" cy="20" r="6" fill="#fb6058"/><circle cx="42" cy="20" r="6" fill="#f5bd4f"/><circle cx="62" cy="20" r="6" fill="#34c949"/><text x="88" y="25" fill="#9298b0" font-family="monospace" font-size="13">Stealth Box · actual TUI output</text><g font-family="monospace" font-size="16">'+''.join(elements)+'</g></svg>'
    assets=ROOT/'docs/assets';assets.mkdir(exist_ok=True);(assets/'tui.svg').write_text(svg)
-   print('PASS TUI project creation, bridge settings, Esc, terminal restoration')
+   print('PASS TUI signal interruptions, project creation, bridge settings, Esc, terminal restoration')
   finally:
    if p.poll() is None:
     p.terminate()

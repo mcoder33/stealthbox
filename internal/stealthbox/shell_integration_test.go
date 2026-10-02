@@ -122,12 +122,12 @@ func TestManagedZshPreservesStartupPathAndOverridesAliases(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(home, ".zshenv"), []byte("export ZDOTDIR="+Quote(original)+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(filepath.Join(original, ".zshrc"), []byte("alias codex='echo old-alias'\nexport USER_STYLE=kept\n"), 0600); err != nil {
+	if err = os.WriteFile(filepath.Join(original, ".zshrc"), []byte("alias codex='echo old-alias'\nexport USER_STYLE=kept\nexport PATH=/user-custom-tools:$PATH\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SHELL", zsh)
 	t.Setenv("ZDOTDIR", home)
-	argv, err := managedShellCommand(c, []string{"-i", "-c", "printf '%s\\n' \"$USER_STYLE\"; whence -w codex"})
+	argv, err := managedShellCommand(c, []string{"-i", "-c", "printf '%s\\n' \"$USER_STYLE\" \"$PATH\"; whence -w codex"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestManagedZshPreservesStartupPathAndOverridesAliases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err, string(b))
 	}
-	if !strings.Contains(string(b), "kept") || !strings.Contains(string(b), "codex: function") {
+	if !strings.Contains(string(b), "kept") || !strings.Contains(string(b), "/user-custom-tools:") || !strings.Contains(string(b), "codex: function") {
 		t.Fatal(string(b))
 	}
 }

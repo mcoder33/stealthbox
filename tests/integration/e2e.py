@@ -39,7 +39,7 @@ def main():
             remote=lambda *argv:call(ssh+[shlex.join(argv)])
             wait_for(lambda:remote('true') == '')
             env=dict(os.environ,STEALTHBOX_SSH_CONFIG=str(ssh_config),TERM='xterm-256color');env.pop('TMUX',None)
-            call([str(BIN),'init','--config',str(config),'--host','sb-test','--enable-mac','--allow-mac-exec'],env=env)
+            call([str(BIN),'init','--config',str(config),'--host','sb-test','--vm-root','','--enable-mac','--allow-mac-exec'],env=env)
             call([str(BIN),'project','--config',str(config),'--project','demo','--path','/home/developer/project','--mac-path',str(mac),'--agent','codex','--runner','mac'],env=env)
             c=json.loads(config.read_text());c['bridge']['socket']=str(temp/'mac.sock')
             c['agents']={'codex':['sh','-c',"printf 'CODEX-READY\\n'; echo start >> /home/developer/codex-starts; exec sh"],'claude':['sh','-c',"printf 'CLAUDE-READY\\n'; exec sh"],'shell':['sh','-l']}

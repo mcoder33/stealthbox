@@ -27,7 +27,7 @@ func main() {
 		return
 	}
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h" || args[0] == "help") {
-		fmt.Println("Stealth Box for Windows (WSL 2 launcher)\nRequires a configured WSL Linux distribution with OpenSSH and rsync.\nRun without arguments for the settings TUI. All paths and SSH settings are inside WSL.\nSet STEALTHBOX_WSL_DISTRO to select a distribution.\nFor full CLI help: stealthbox.exe help --wsl")
+		fmt.Println("Stealth Box for Windows (WSL 2 launcher)\nRequires a configured WSL Linux distribution with OpenSSH and rsync.\nRun without arguments to prepare and resume remote tmux; use 'settings' for the TUI.\nAll paths and SSH settings are inside WSL.\nSet STEALTHBOX_WSL_DISTRO to select a distribution.\nFor full CLI help: stealthbox.exe help --wsl")
 		return
 	}
 	if len(args) == 2 && args[0] == "help" && args[1] == "--wsl" {

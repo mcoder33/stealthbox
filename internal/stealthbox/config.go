@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
 type WorkspaceConfig struct {
+	Runner           string    `json:"runner,omitempty"`
+	Prepare          *bool     `json:"prepare,omitempty"`
 	VMRoot           string    `json:"vm_root,omitempty"`
 	LocalRoot        string    `json:"local_root,omitempty"`
 	RunnerRoot       string    `json:"runner_root,omitempty"`
@@ -23,6 +26,22 @@ type WorkspaceConfig struct {
 	Theme            string    `json:"theme,omitempty"`
 	Forwards         []Forward `json:"forwards,omitempty"`
 }
+
+// WorkspaceRunner is a default for commands, never an identity of a tmux session.
+func WorkspaceRunner(c Config) string {
+	if c.Workspace.Runner != "" {
+		return runnerAlias(c.Workspace.Runner)
+	}
+	if c.Bridge.Enabled {
+		return "mac"
+	}
+	return "vm"
+}
+
+func PrepareEnabled(c Config) bool {
+	return WorkspaceRootEnabled(c) && (c.Workspace.Prepare == nil || *c.Workspace.Prepare)
+}
+
 type Forward struct {
 	Local  int `json:"local"`
 	Remote int `json:"remote"`
@@ -46,9 +65,16 @@ func DefaultConfig() (Config, error) {
 	if _, err = rand.Read(token); err != nil {
 		return Config{}, err
 	}
-	return Config{Projects: map[string]Project{}, Workspace: WorkspaceConfig{Host: "dev-vm", Name: "stealthbox"}, Bridge: BridgeConfig{Socket: filepath.Join(home, ".config", "stealthbox", "mac.sock"), Token: hex.EncodeToString(token), TimeoutSeconds: 1800, MaxBytes: 1 << 30}, Agents: map[string][]string{"codex": {"codex"}, "claude": {"claude"}, "shell": {"sh", "-c", "exec \"${SHELL:-/bin/sh}\" -l"}}}, nil
+	return Config{Projects: map[string]Project{}, Workspace: WorkspaceConfig{Host: "dev-vm", Name: "stealthbox"}, Bridge: BridgeConfig{Socket: filepath.Join(home, ".config", "stealthbox", "mac.sock"), Token: hex.EncodeToString(token), TimeoutSeconds: 1800, MaxBytes: 1 << 30}, Agents: standardAgents()}, nil
+}
+
+func standardAgents() map[string][]string {
+	return map[string][]string{"codex": {"codex"}, "claude": {"claude"}, "shell": {"sh", "-c", "exec \"${SHELL:-/bin/sh}\" -l"}}
 }
 func (c Config) Validate() error {
+	if c.Workspace.Runner != "" && runnerAlias(c.Workspace.Runner) != "vm" && runnerAlias(c.Workspace.Runner) != "mac" {
+		return fmt.Errorf("workspace runner must be vm or local")
+	}
 	if err := validateWorkspaceRoots(c); err != nil {
 		return err
 	}
@@ -140,6 +166,14 @@ func Save(path string, c Config) error {
 	}
 	if err := c.Validate(); err != nil {
 		return err
+	}
+	standard := standardAgents()
+	same := len(c.Agents) == len(standard)
+	for name, argv := range standard {
+		same = same && slices.Equal(argv, c.Agents[name])
+	}
+	if same {
+		c.Agents = nil
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {

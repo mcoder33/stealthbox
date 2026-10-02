@@ -104,6 +104,9 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
+	if err := NormalizeLocalWorkspaceRoots(&c); err != nil {
+		return c, err
+	}
 	if err := c.Validate(); err != nil {
 		return c, err
 	}

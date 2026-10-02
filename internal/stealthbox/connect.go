@@ -15,6 +15,7 @@ type ConnectOptions struct {
 	Project, Agent, Runner, Slot, Binary, Session string
 	Extra                                         []string
 	Reconnect                                     bool
+	Resume                                        bool
 }
 
 func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdout, stderr io.Writer) error {
@@ -39,7 +40,7 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 			o.Agent = "shell"
 		}
 		if o.Runner == "" {
-			o.Runner = "vm"
+			o.Runner = WorkspaceRunner(*c)
 		}
 		if o.Runner != "vm" && o.Runner != "mac" {
 			return fmt.Errorf("root workspace runner must be local or vm")
@@ -51,19 +52,8 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 	if _, configured := p.Runners[o.Runner]; ok && !configured {
 		return fmt.Errorf("runner is not configured")
 	}
-	if c.Workspace.RemoteDir == "" {
-		if err := Setup(ctx, c, path, o.Binary, stdout); err != nil {
-			return err
-		}
-	} else {
-		remoteBin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
-		if _, err := Output(ctx, sshCommand(c.Workspace.Host, "test -x "+Quote(remoteBin), false)); err != nil {
-			if err = Setup(ctx, c, path, o.Binary, stdout); err != nil {
-				return err
-			}
-		} else if err = DeployConfig(ctx, *c); err != nil {
-			return err
-		}
+	if err := EnsureReady(ctx, c, path, o.Binary, stderr); err != nil {
+		return err
 	}
 	if c.Bridge.Enabled {
 		if err := StartBridgeService(ctx, *c, path, stderr); err != nil {
@@ -93,6 +83,9 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 		}
 		if o.Slot != "" {
 			argv = append(argv, "--slot", o.Slot)
+		}
+		if o.Resume && o.Session != "shell" {
+			argv = append(argv, "--resume-workspace")
 		}
 		if len(o.Extra) > 0 {
 			argv = append(argv, "--")

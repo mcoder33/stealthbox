@@ -52,16 +52,18 @@ func configDefault() (string, error) {
 	return filepath.Join(home, ".config", "stealthbox", "config.json"), err
 }
 func run(ctx context.Context, args []string) error {
+	stealthbox.BuildVersion = version
 	def, err := configDefault()
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
 		if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
-			return stealthbox.TUI(ctx, def)
+			args = []string{"connect"}
+		} else {
+			usage()
+			return nil
 		}
-		usage()
-		return nil
 	}
 	if args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		usage()
@@ -70,6 +72,13 @@ func run(ctx context.Context, args []string) error {
 	if args[0] == "--version" || args[0] == "version" {
 		fmt.Println("stealthbox", version)
 		return nil
+	}
+	if args[0] == "handshake" {
+		fmt.Println(stealthbox.Handshake())
+		return nil
+	}
+	if strings.HasPrefix(args[0], "--") {
+		args = append([]string{"connect"}, args...)
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	parseArgs := args[1:]
@@ -110,6 +119,7 @@ func run(ctx context.Context, args []string) error {
 	on := f.String("on", "vm", "execution host: vm or mac")
 	cwd := f.String("cwd", "", "command directory relative to the selected checkout")
 	noAttach := f.Bool("no-attach", false, "create/select window without attaching (VM command)")
+	resumeWorkspace := f.Bool("resume-workspace", false, "resume the current workspace window (internal)")
 	reconnect := f.Bool("reconnect", true, "reconnect after SSH transport failure")
 	artifact := f.String("file", "", "artifact path relative to Mac runner")
 	output := f.String("output", "", "local output file (must not exist)")
@@ -142,6 +152,9 @@ func run(ctx context.Context, args []string) error {
 		if visited["shell-integration"] {
 			c.Workspace.ShellIntegration = *shellIntegration
 		}
+		if visited["runner"] && (args[0] == "init" || args[0] == "config") {
+			c.Workspace.Runner = *runner
+		}
 		if oldHost != c.Workspace.Host || oldRoot != c.Workspace.VMRoot {
 			c.Workspace.ID = ""
 		}
@@ -160,16 +173,19 @@ func run(ctx context.Context, args []string) error {
 		if e != nil {
 			return e
 		}
+		if !visited["vm-root"] {
+			c.Workspace.VMRoot = "~/Projects"
+		}
 		if e = applyWorkspaceFlags(&c); e != nil {
 			return e
 		}
-		c.Bridge.Enabled = *enableMac
+		c.Bridge.Enabled = c.Bridge.Enabled || *enableMac
 		c.Bridge.AllowExec = *allowExec
 		if err = stealthbox.Save(*config, c); err == nil {
-			fmt.Println("Created", *config, "(mode 0600). Use stealthbox tui to configure a Projects workspace or add projects.")
+			fmt.Println("Created", *config, "(mode 0600). Run stealthbox to prepare and open your tmux workspace.")
 		}
 		return err
-	case "tui":
+	case "tui", "settings":
 		if *dry {
 			return fmt.Errorf("--dry-run is not used with TUI")
 		}
@@ -177,6 +193,9 @@ func run(ctx context.Context, args []string) error {
 	}
 	c, err := stealthbox.Load(*config)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("configuration not found: %s; create it once with stealthbox init --host YOUR_SSH_ALIAS", *config)
+		}
 		return err
 	}
 	if err = applyWorkspaceFlags(&c); err != nil {
@@ -203,7 +222,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		changed := false
-		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration"} {
+		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration", "runner"} {
 			changed = changed || visited[name]
 		}
 		if changed {
@@ -261,10 +280,15 @@ func run(ctx context.Context, args []string) error {
 		return stealthbox.Save(*config, c)
 	case "setup":
 		if *dry {
-			fmt.Printf("Would probe %s, install binary/config/theme, and save detected paths.\n", c.Workspace.Host)
+			fmt.Printf("Would prepare %s: tmux, Git, rsync, Codex, Claude, terminal support and validated style.\n", c.Workspace.Host)
 			return nil
 		}
 		return stealthbox.Setup(ctx, &c, *config, *binary, os.Stdout)
+	case "theme-apply":
+		if *dry {
+			return nil
+		}
+		return stealthbox.ApplyTheme(ctx, c, *artifact, os.Stdout)
 	case "theme":
 		if *dry {
 			fmt.Println("Would export effective local tmux options and keys")
@@ -303,12 +327,7 @@ func run(ctx context.Context, args []string) error {
 			fmt.Println("Would start background Mac bridge")
 			return nil
 		}
-		if c.Workspace.RemoteDir == "" {
-			if err = stealthbox.Setup(ctx, &c, *config, *binary, os.Stdout); err != nil {
-				return err
-			}
-		}
-		if err = stealthbox.DeployConfig(ctx, c); err != nil {
+		if err = stealthbox.EnsureReady(ctx, &c, *config, *binary, os.Stdout); err != nil {
 			return err
 		}
 		return stealthbox.StartBridgeService(ctx, c, *config, os.Stdout)
@@ -400,11 +419,15 @@ func run(ctx context.Context, args []string) error {
 			*agent = "shell"
 		}
 		if *runner == "" {
-			*runner = "vm"
+			*runner = stealthbox.WorkspaceRunner(c)
 		}
 	}
 	switch args[0] {
 	case "open", "connect":
+		resume := !visited["agent"] && !visited["project"] && !visited["path"] && !visited["slot"] && len(f.Args()) == 0
+		if resume {
+			*agent = "shell"
+		}
 		if *session != "tmux" && *session != "shell" {
 			return fmt.Errorf("session must be tmux or shell")
 		}
@@ -412,7 +435,7 @@ func run(ctx context.Context, args []string) error {
 			fmt.Printf("Mac terminal → SSH %s → %s workspace; project=%s agent=%s runner=%s slot=%s; Mac bridge=%t\n", c.Workspace.Host, *session, *project, *agent, *runner, *slot, c.Bridge.Enabled)
 			return nil
 		}
-		return stealthbox.Connect(ctx, &c, *config, stealthbox.ConnectOptions{Project: *project, Agent: *agent, Runner: *runner, Slot: *slot, Binary: *binary, Extra: f.Args(), Reconnect: *reconnect, Session: *session}, os.Stdout, os.Stderr)
+		return stealthbox.Connect(ctx, &c, *config, stealthbox.ConnectOptions{Project: *project, Agent: *agent, Runner: *runner, Slot: *slot, Binary: *binary, Extra: f.Args(), Reconnect: *reconnect, Session: *session, Resume: resume}, os.Stdout, os.Stderr)
 	case "workspace":
 		if *dry {
 			fmt.Println(stealthbox.WindowName(*project, *agent, *runner, *slot, f.Args()))
@@ -420,6 +443,9 @@ func run(ctx context.Context, args []string) error {
 		}
 		if *session == "shell" {
 			return stealthbox.PlainRemote(ctx, c, *config, *project, *agent, *runner, f.Args(), os.Stdout, os.Stderr)
+		}
+		if *resumeWorkspace {
+			return stealthbox.ResumeWorkspaceRemote(ctx, c, *config, *project, *runner, !*noAttach, os.Stdout, os.Stderr)
 		}
 		return stealthbox.WorkspaceRemote(ctx, c, *config, *project, *agent, *runner, *slot, f.Args(), !*noAttach, os.Stdout, os.Stderr)
 	case "agent":
@@ -486,15 +512,15 @@ func run(ctx context.Context, args []string) error {
 func usage() {
 	fmt.Println(`Stealth Box — your terminal, remote tmux, agents and a selectable Mac/VM runner
 
-  stealthbox                         Interactive TUI (when stdin/stdout are a terminal)
-  stealthbox tui [--config PATH]      Projects, agents, runners, theme, deployment, doctor
-  stealthbox init --host dev-vm [--enable-mac] [--allow-mac-exec]
+  stealthbox                         Prepare and resume your remote tmux workspace
+  stealthbox settings [--config PATH] Optional settings and diagnostics (alias: tui)
+  stealthbox init --host dev-vm [--runner local|vm] [--allow-mac-exec]
   stealthbox config --vm-root '~/Projects' --local-root ~/Projects --runner-root ~/.local/share/stealthbox/runners --shell-integration
   stealthbox project --project NAME --path /home/user/project --mac-path /Users/user/runner
-  stealthbox setup [--binary PATH]    Deploy binary/config to the VM; detect HOME and platform
+  stealthbox setup [--binary PATH]    Prepare VM tools, Codex, Claude, binary, terminal and style
   stealthbox theme                    Export current local tmux options/key bindings
   stealthbox connect --project NAME --agent codex --runner mac [--slot main]
-  stealthbox connect                 Open a shell at VM Projects root when vm_root is configured
+  stealthbox connect                 Same as bare stealthbox: resume the active workspace window
   stealthbox agent codex|claude|shell [--path CHECKOUT] [--runner local|vm] -- ARGS
   stealthbox open ...                 Alias for connect; --session shell skips tmux
   stealthbox run [--path CHECKOUT] [--cwd RELATIVE] [--runner local|vm] -- COMMAND [ARGS...]

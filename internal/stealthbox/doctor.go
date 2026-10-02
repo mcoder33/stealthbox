@@ -46,7 +46,7 @@ func Doctor(ctx context.Context, c Config, w io.Writer) error {
 				continue
 			}
 			check("workspace agent "+name, func(ctx context.Context) error {
-				_, e := Output(ctx, sshCommand(c.Workspace.Host, "command -v "+Quote(args[0]), false))
+				_, e := Output(ctx, sshCommand(c.Workspace.Host, remoteToolPath+"; command -v "+Quote(args[0]), false))
 				return e
 			})
 		}
@@ -75,7 +75,7 @@ func Doctor(ctx context.Context, c Config, w io.Writer) error {
 			args = []string{agent}
 		}
 		check("agent "+agent+" for "+name, func(ctx context.Context) error {
-			_, e := Output(ctx, At(p.Source, "command -v "+Quote(args[0]), false))
+			_, e := Output(ctx, At(p.Source, remoteToolPath+"; command -v "+Quote(args[0]), false))
 			return e
 		})
 	}

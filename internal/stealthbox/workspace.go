@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func JSONString(v any) string { b, _ := json.Marshal(v); return string(b) }
@@ -22,6 +23,14 @@ func WindowName(project, agent, runner, slot string, extra []string) string {
 	return base
 }
 func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, runner, slot string, extra []string, attach bool, stdout, stderr io.Writer) error {
+	return workspaceRemote(ctx, c, configPath, project, agent, runner, slot, extra, attach, false, stdout, stderr)
+}
+
+func ResumeWorkspaceRemote(ctx context.Context, c Config, configPath, project, runner string, attach bool, stdout, stderr io.Writer) error {
+	return workspaceRemote(ctx, c, configPath, project, "shell", runner, "main", nil, attach, true, stdout, stderr)
+}
+
+func workspaceRemote(ctx context.Context, c Config, configPath, project, agent, runner, slot string, extra []string, attach, resume bool, stdout, stderr io.Writer) error {
 	launch, err := resolveWorkspaceLaunch(ctx, c, project, agent, runner)
 	if err != nil {
 		return err
@@ -41,6 +50,9 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 		name = "stealthbox"
 	}
 	window := WindowName(launch.label, agent, runner, slot, extra)
+	if resume {
+		window = "shell"
+	}
 	environment, err := workspaceLaunchScript(c, configPath, launch, extra)
 	if err != nil {
 		return err
@@ -57,7 +69,7 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 		if _, err = invoke("new-session", "-d", "-s", name, "-n", window, "-c", launch.directory, environment); err != nil {
 			return fmt.Errorf("create tmux workspace: %w", err)
 		}
-	} else {
+	} else if !resume {
 		b, e := invoke("list-windows", "-t", name, "-F", "#{window_name}")
 		if e != nil {
 			return e
@@ -82,7 +94,7 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 		if e != nil {
 			return e
 		}
-		for key, value := range map[string]string{"STEALTHBOX_CONFIG": configPath, "STEALTHBOX_SCOPE": "workspace", "STEALTHBOX_PROJECT": "", "STEALTHBOX_RUNNER": runner, "STEALTHBOX_VM_ROOT": c.Workspace.VMRoot, "PATH": filepath.Dir(mustExecutable()) + ":" + os.Getenv("PATH")} {
+		for key, value := range map[string]string{"STEALTHBOX_CONFIG": configPath, "STEALTHBOX_SCOPE": "workspace", "STEALTHBOX_PROJECT": "", "STEALTHBOX_RUNNER": runner, "STEALTHBOX_VM_ROOT": c.Workspace.VMRoot, "PATH": managedPath()} {
 			if _, e = invoke("set-environment", "-t", name, key, value); e != nil {
 				return e
 			}
@@ -91,8 +103,10 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 			return e
 		}
 	}
-	if _, err = invoke("select-window", "-t", name+":"+window); err != nil {
-		return err
+	if !resume {
+		if _, err = invoke("select-window", "-t", name+":"+window); err != nil {
+			return err
+		}
 	}
 	if !attach {
 		_, err = fmt.Fprintln(stdout, window)
@@ -106,6 +120,7 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 func mustExecutable() string { p, _ := os.Executable(); return p }
 func ThemeSnapshot(ctx context.Context) ([]byte, error) {
 	// Export effective options/key bindings instead of running local plugin installers remotely.
+	defaults := defaultStatusFormats(ctx)
 	var lines []string
 	for _, args := range [][]string{{"show-options", "-g"}, {"show-window-options", "-g"}, {"list-keys"}} {
 		b, e := exec.CommandContext(ctx, "tmux", args...).Output()
@@ -123,17 +138,52 @@ func ThemeSnapshot(ctx context.Context) ([]byte, error) {
 				lines = append(lines, line)
 				continue
 			}
-			if strings.HasPrefix(line, "default-shell ") || strings.HasPrefix(line, "default-command ") || strings.HasPrefix(line, "@") {
+			if strings.HasPrefix(line, "default-shell ") || strings.HasPrefix(line, "default-command ") {
+				continue
+			}
+			// tmux's own generated status layout changes between releases. Let the
+			// VM use its matching default, while retaining custom user layouts.
+			if strings.HasPrefix(line, "status-format[") && (defaults == nil || defaults[line]) {
 				continue
 			}
 			prefix := "set-option -q -g "
 			if args[0] == "show-window-options" {
 				prefix = "set-window-option -q -g "
 			}
-			lines = append(lines, prefix+line)
+			if normalized := NormalizeThemeLine(prefix + line); normalized != "" {
+				lines = append(lines, normalized)
+			}
 		}
 	}
-	return []byte("# Effective options exported by Stealth Box. Fonts stay in your local terminal.\n" + strings.Join(lines, "\n") + "\nset-option -g allow-rename off\n"), nil
+	return []byte("# Stealth Box theme v2. Effective options; fonts stay in your local terminal.\n" + strings.Join(lines, "\n") + "\nset-option -g allow-rename off\n"), nil
+}
+
+func defaultStatusFormats(ctx context.Context) map[string]bool {
+	dir, err := os.MkdirTemp("", "sb-style-")
+	if err != nil {
+		return nil
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Base(dir)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if exec.CommandContext(ctx, "tmux", "-L", socket, "-f", "/dev/null", "new-session", "-d", "-s", "defaults", "sleep 30").Run() != nil {
+		return nil
+	}
+	defer func() {
+		cleanup, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		_ = exec.CommandContext(cleanup, "tmux", "-L", socket, "kill-server").Run()
+	}()
+	data, err := exec.CommandContext(ctx, "tmux", "-L", socket, "show-options", "-g", "status-format").Output()
+	if err != nil {
+		return nil
+	}
+	result := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		result[line] = true
+	}
+	return result
 }
 
 func PlainRemote(ctx context.Context, c Config, configPath, project, agent, runner string, extra []string, stdout, stderr io.Writer) error {

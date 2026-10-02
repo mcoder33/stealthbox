@@ -64,7 +64,11 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 }
 
 func Output(ctx context.Context, cmd Command) ([]byte, error) {
-	return exec.CommandContext(ctx, cmd.Program, cmd.Args...).Output()
+	out, err := exec.CommandContext(ctx, cmd.Program, cmd.Args...).Output()
+	if failed, ok := err.(*exec.ExitError); ok && len(failed.Stderr) > 0 {
+		return out, fmt.Errorf("%s: %w: %s", cmd.Program, err, failed.Stderr)
+	}
+	return out, err
 }
 func Guide(project, runner string) string {
 	if project == "" {
@@ -86,6 +90,9 @@ func AgentCommand(c Config, configPath, project, agent, runner string, extra []s
 		}
 	}
 	args = append([]string{}, args...)
+	if nativeAgentUtility(extra) {
+		return append(args, extra...), nil
+	}
 	bin, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -100,6 +107,17 @@ func AgentCommand(c Config, configPath, project, agent, runner string, extra []s
 		args = append(args, "--append-system-prompt", Guide(project, runner), "--mcp-config", JSONString(map[string]any{"mcpServers": map[string]any{"stealthbox": map[string]any{"command": bin, "args": []string{"mcp", "--config", configPath}, "env": map[string]string{"STEALTHBOX_PROJECT": project, "STEALTHBOX_RUNNER": runner, "STEALTHBOX_SCOPE": agentScope(c, project)}}}}))
 	}
 	return append(args, extra...), nil
+}
+
+func nativeAgentUtility(extra []string) bool {
+	if len(extra) == 0 {
+		return false
+	}
+	switch extra[0] {
+	case "--version", "-V", "--help", "-h", "help", "login", "logout", "auth", "doctor", "update", "mcp", "plugin", "completion":
+		return true
+	}
+	return false
 }
 
 func agentScope(c Config, project string) string {

@@ -64,7 +64,7 @@ func resolveWorkspaceLaunch(ctx context.Context, c Config, selector, agent, runn
 		agent = "shell"
 	}
 	if runner == "" {
-		runner = "vm"
+		runner = WorkspaceRunner(c)
 	}
 	runner = runnerAlias(runner)
 	if runner != "vm" && runner != "mac" {
@@ -98,12 +98,19 @@ func workspaceLaunchScript(c Config, configPath string, launch workspaceLaunch, 
 			return "", err
 		}
 	}
-	env := "export PATH=" + Quote(filepath.Dir(mustExecutable())) + ":\"$PATH\" STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(launch.binding) + " STEALTHBOX_SCOPE=" + Quote(launch.scope) + " STEALTHBOX_RUNNER=" + Quote(launch.runner) + " STEALTHBOX_AGENT=" + Quote(launch.agent) + " STEALTHBOX_VM_ROOT=" + Quote(c.Workspace.VMRoot)
+	env := "export PATH=" + Quote(managedPath()) + " STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(launch.binding) + " STEALTHBOX_SCOPE=" + Quote(launch.scope) + " STEALTHBOX_RUNNER=" + Quote(launch.runner) + " STEALTHBOX_AGENT=" + Quote(launch.agent) + " STEALTHBOX_VM_ROOT=" + Quote(c.Workspace.VMRoot)
 	return env + "; exec " + shellArgs(cmd), nil
 }
 
 // LaunchAgent is used inside the managed VM shell. It does not open another tmux.
 func LaunchAgent(ctx context.Context, c Config, configPath, selector, agent, runner string, extra []string, stdout, stderr io.Writer) error {
+	if nativeAgentUtility(extra) {
+		args, err := AgentCommand(c, configPath, "", agent, runner, extra)
+		if err != nil {
+			return err
+		}
+		return ExecuteContext(ctx, At(Endpoint{}, "export PATH="+Quote(managedPath())+"; exec "+shellArgs(args), false), os.Stdin, stdout, stderr)
+	}
 	if selector == "" && WorkspaceRootEnabled(c) {
 		var err error
 		selector, err = os.Getwd()
@@ -135,7 +142,8 @@ func managedShellCommand(c Config, extra []string) ([]string, error) {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	functions := shellAgentFunctions()
+	// User startup files may reset PATH. Restore the managed tools afterwards.
+	functions := "\nexport PATH=" + Quote(managedBins()) + ":\"$PATH\"\n" + shellAgentFunctions()
 	switch filepath.Base(shell) {
 	case "bash":
 		file := filepath.Join(dir, "bashrc")
@@ -194,6 +202,20 @@ func expandLocalPath(path string) (string, error) {
 
 func NormalizeLocalWorkspaceRoots(c *Config) error {
 	var err error
+	if WorkspaceRootEnabled(*c) {
+		if c.Workspace.LocalRoot == "" {
+			c.Workspace.LocalRoot = "~/Projects"
+		}
+		if c.Workspace.RunnerRoot == "" {
+			c.Workspace.RunnerRoot = "~/.local/share/stealthbox/runners"
+		}
+		if PrepareEnabled(*c) {
+			c.Workspace.ShellIntegration = true
+		}
+		if runnerAlias(c.Workspace.Runner) == "mac" {
+			c.Bridge.Enabled = true
+		}
+	}
 	if c.Workspace.LocalRoot, err = expandLocalPath(c.Workspace.LocalRoot); err != nil {
 		return err
 	}

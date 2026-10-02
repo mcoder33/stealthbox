@@ -129,33 +129,41 @@ func binaryFor(ctx context.Context, goos, arch string) (string, func(), error) {
 	}
 	// A source checkout can bootstrap before a release exists; installed binaries use release assets.
 	wd, _ := os.Getwd()
-	for root := wd; ; root = filepath.Dir(root) {
-		data, e := os.ReadFile(filepath.Join(root, "go.mod"))
-		if e == nil && strings.Contains(string(data), "module github.com/mcoder33/stealthbox") {
-			dir, e := os.MkdirTemp("", "stealthbox-build-")
-			if e != nil {
-				return "", nil, e
+	executable, _ := os.Executable()
+	visited := map[string]bool{}
+	for _, start := range []string{wd, filepath.Dir(executable)} {
+		for root := start; !visited[root]; root = filepath.Dir(root) {
+			visited[root] = true
+			data, e := os.ReadFile(filepath.Join(root, "go.mod"))
+			if e == nil && strings.Contains(string(data), "module github.com/mcoder33/stealthbox") {
+				dir, e := os.MkdirTemp("", "stealthbox-build-")
+				if e != nil {
+					return "", nil, e
+				}
+				out := filepath.Join(dir, "stealthbox")
+				cmd := exec.CommandContext(ctx, "go", "build", "-ldflags", "-X main.version="+BuildVersion, "-o", out, "./cmd/stealthbox")
+				cmd.Dir = root
+				cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+arch, "CGO_ENABLED=0")
+				b, e := cmd.CombinedOutput()
+				if e != nil {
+					os.RemoveAll(dir)
+					return "", nil, fmt.Errorf("cross-build: %w: %s", e, b)
+				}
+				return out, func() { os.RemoveAll(dir) }, nil
 			}
-			out := filepath.Join(dir, "stealthbox")
-			cmd := exec.CommandContext(ctx, "go", "build", "-o", out, "./cmd/stealthbox")
-			cmd.Dir = root
-			cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+arch, "CGO_ENABLED=0")
-			b, e := cmd.CombinedOutput()
-			if e != nil {
-				os.RemoveAll(dir)
-				return "", nil, fmt.Errorf("cross-build: %w: %s", e, b)
+			if root == filepath.Dir(root) {
+				break
 			}
-			return out, func() { os.RemoveAll(dir) }, nil
-		}
-		if root == filepath.Dir(root) {
-			break
 		}
 	}
 	return releaseBinary(ctx, goos, arch)
 }
 func releaseBinary(ctx context.Context, goos, arch string) (string, func(), error) {
 	name := "stealthbox-" + goos + "-" + arch
-	base := "https://github.com/mcoder33/stealthbox/releases/latest/download/"
+	if !strings.HasPrefix(BuildVersion, "v") || strings.ContainsAny(BuildVersion, "/\\ \n\r") {
+		return "", nil, fmt.Errorf("this development build needs a source checkout with Go or --binary pointing to a matching VM binary")
+	}
+	base := "https://github.com/mcoder33/stealthbox/releases/download/" + BuildVersion + "/"
 	client := &http.Client{Timeout: 2 * time.Minute}
 	fetch := func(asset string, limit int64) ([]byte, error) {
 		req, _ := http.NewRequestWithContext(ctx, "GET", base+asset, nil)
@@ -207,10 +215,17 @@ func releaseBinary(ctx context.Context, goos, arch string) (string, func(), erro
 	return path, func() { os.RemoveAll(dir) }, nil
 }
 
-// Setup installs only Stealth Box/config/theme, never agents, Docker, SSH keys or project code.
+// Setup prepares the workspace and its two standard agents. User credentials
+// and source working copies are never implicitly copied or overwritten.
 func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.Writer) error {
 	goos, arch, err := resolveRemote(ctx, c)
 	if err != nil {
+		return err
+	}
+	if err = prepareRemoteTools(ctx, *c, stdout); err != nil {
+		return err
+	}
+	if err = prepareWorkspaceTheme(ctx, c, configPath, stdout); err != nil {
 		return err
 	}
 	if binary == "" {
@@ -227,10 +242,18 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 	}
 	defer file.Close()
 	remoteBin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
-	if err = upload(ctx, c.Workspace.Host, remoteBin, file); err != nil {
+	candidate := remoteBin + ".candidate"
+	if err = upload(ctx, c.Workspace.Host, candidate, file); err != nil {
 		return err
 	}
-	if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "chmod 700 "+Quote(remoteBin)+"; umask 077; mkdir -p "+Quote(filepath.Dir(c.Bridge.RemoteSocket)), false), nil, io.Discard, io.Discard); err != nil {
+	if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "chmod 700 "+Quote(candidate), false), nil, io.Discard, io.Discard); err != nil {
+		return err
+	}
+	probe, err := Output(ctx, sshCommand(c.Workspace.Host, Quote(candidate)+" handshake", false))
+	if err != nil || strings.TrimSpace(string(probe)) != Handshake() {
+		return fmt.Errorf("VM binary does not match this Stealth Box version; supply a matching --binary (existing installation was kept)")
+	}
+	if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "mv "+Quote(candidate)+" "+Quote(remoteBin)+" && umask 077 && mkdir -p "+Quote(filepath.Dir(c.Bridge.RemoteSocket)), false), nil, io.Discard, io.Discard); err != nil {
 		return err
 	}
 	if WorkspaceRootEnabled(*c) {
@@ -238,7 +261,10 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 			return err
 		}
 	}
-	if err = DeployConfig(ctx, *c); err != nil {
+	if err = DeployConfigWithOutput(ctx, *c, stdout); err != nil {
+		return err
+	}
+	if err = prepareTerminfo(ctx, *c); err != nil {
 		return err
 	}
 	if err = Save(configPath, *c); err != nil {
@@ -248,6 +274,10 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 	return nil
 }
 func DeployConfig(ctx context.Context, c Config) error {
+	return DeployConfigWithOutput(ctx, c, io.Discard)
+}
+
+func DeployConfigWithOutput(ctx context.Context, c Config, stdout io.Writer) error {
 	remote, err := remoteConfig(c)
 	if err != nil {
 		return err
@@ -264,8 +294,13 @@ func DeployConfig(ctx context.Context, c Config) error {
 		if err != nil {
 			return err
 		}
-		if err = upload(ctx, c.Workspace.Host, filepath.Join(c.Workspace.RemoteDir, "tmux.conf"), bytes.NewReader(b)); err != nil {
+		candidate := filepath.Join(c.Workspace.RemoteDir, "tmux.source.conf")
+		if err = upload(ctx, c.Workspace.Host, candidate, bytes.NewReader(b)); err != nil {
 			return err
+		}
+		args := []string{filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox"), "theme-apply", "--config", filepath.Join(c.Workspace.RemoteDir, "config.json"), "--file", candidate}
+		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false), nil, stdout, stdout); err != nil {
+			return fmt.Errorf("validate remote tmux style: %w", err)
 		}
 	}
 	guide := []byte(Guide("configured project", "selected runner") + "\n")
