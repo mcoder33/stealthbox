@@ -12,7 +12,7 @@ import (
 
 func excluded(path string) bool {
 	for _, p := range strings.Split(filepath.ToSlash(path), "/") {
-		if p == ".git" || strings.HasPrefix(p, ".env") || p == "node_modules" || p == "vendor" || p == ".serena" || p == ".claude" || p == ".codex" || p == ".agents" || p == ".opencode" || p == ".kimi-code" || p == ".stealthbox-runner" {
+		if p == ".git" || strings.HasPrefix(p, ".env") || p == "node_modules" || p == "vendor" || p == ".serena" || p == ".claude" || p == ".codex" || p == ".agents" || p == ".opencode" || p == ".kimi-code" || p == ".stealthbox-runner" || p == ".stealthbox-qa" {
 			return true
 		}
 	}

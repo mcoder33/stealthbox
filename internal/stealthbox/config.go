@@ -16,6 +16,8 @@ type WorkspaceConfig struct {
 	Prepare          *bool     `json:"prepare,omitempty"`
 	VMRoot           string    `json:"vm_root,omitempty"`
 	LocalRoot        string    `json:"local_root,omitempty"`
+	SourceExcludes   []string  `json:"source_excludes,omitempty"`
+	SourceSafeLinks  bool      `json:"source_safe_links,omitempty"`
 	RunnerRoot       string    `json:"runner_root,omitempty"`
 	ID               string    `json:"id,omitempty"`
 	ShellIntegration bool      `json:"shell_integration,omitempty"`
@@ -72,6 +74,9 @@ func standardAgents() map[string][]string {
 	return map[string][]string{"codex": {"codex"}, "claude": {"claude"}, "shell": {"sh", "-c", "exec \"${SHELL:-/bin/sh}\" -l"}}
 }
 func (c Config) Validate() error {
+	if _, err := canonicalSourceExcludes(c.Workspace.SourceExcludes); err != nil {
+		return err
+	}
 	if c.Workspace.Runner != "" && runnerAlias(c.Workspace.Runner) != "vm" && runnerAlias(c.Workspace.Runner) != "mac" {
 		return fmt.Errorf("workspace runner must be vm or local")
 	}

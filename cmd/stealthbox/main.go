@@ -112,6 +112,8 @@ func run(ctx context.Context, args []string) error {
 	shellIntegration := f.Bool("shell-integration", false, "wrap codex/claude only in the managed workspace shell")
 	plan := f.String("plan", "", "reviewed source sync plan file")
 	expectedHash := f.String("expected-hash", "", "expected destination fingerprint (internal source prepare)")
+	sourceExcludes := f.String("source-excludes", "", "JSON exclusion paths (internal source fingerprint/prepare)")
+	sourceSafeLinks := f.Bool("source-safe-links", false, "preserve safe relative symlinks (internal source fingerprint/prepare)")
 	macPath := f.String("mac-path", "", "dedicated disposable Mac runner path")
 	remove := f.Bool("delete", false, "remove project from config; keep files")
 	enableMac := f.Bool("enable-mac", false, "enable Mac runner bridge")
@@ -355,6 +357,22 @@ func run(ctx context.Context, args []string) error {
 		}
 		return stealthbox.ServeMCP(ctx, c, os.Stdin, os.Stdout)
 	case "source":
+		if visited["source-excludes"] || visited["source-safe-links"] {
+			if sourceAction != "fingerprint" && sourceAction != "prepare" {
+				return fmt.Errorf("--source-excludes and --source-safe-links are only for internal source fingerprint/prepare")
+			}
+			if visited["source-excludes"] {
+				if err = json.Unmarshal([]byte(*sourceExcludes), &c.Workspace.SourceExcludes); err != nil {
+					return fmt.Errorf("invalid source exclusions: %w", err)
+				}
+			}
+			if visited["source-safe-links"] {
+				c.Workspace.SourceSafeLinks = *sourceSafeLinks
+			}
+			if err = c.Validate(); err != nil {
+				return err
+			}
+		}
 		switch sourceAction {
 		case "import", "export":
 			if *dry {

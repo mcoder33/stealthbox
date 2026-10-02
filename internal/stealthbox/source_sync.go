@@ -10,15 +10,18 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 type SourceEntry struct {
-	Path string `json:"path"`
-	Kind string `json:"kind"`
-	Mode uint32 `json:"mode"`
-	Hash string `json:"hash,omitempty"`
+	Path   string `json:"path"`
+	Kind   string `json:"kind"`
+	Mode   uint32 `json:"mode"`
+	Hash   string `json:"hash,omitempty"`
+	Target string `json:"target,omitempty"`
 }
 type SourceState struct {
 	Hash    string        `json:"hash"`
@@ -41,6 +44,8 @@ type SourceSyncPlan struct {
 	SourceHash      string         `json:"source_hash"`
 	DestinationHash string         `json:"destination_hash"`
 	Changes         []SourceChange `json:"changes"`
+	SourceExcludes  []string       `json:"source_excludes,omitempty"`
+	SourceSafeLinks bool           `json:"source_safe_links,omitempty"`
 }
 
 func sourceRelativePath(path string) (string, error) {
@@ -95,7 +100,15 @@ func checkedSourcePath(root, relative string) (string, error) {
 	return path, nil
 }
 
-func sourceStateAt(ctx context.Context, root, relative string) (SourceState, error) {
+func sourceStateAt(ctx context.Context, root, relative string, sourceExcludes ...string) (SourceState, error) {
+	return sourceStateAtWithOptions(ctx, root, relative, sourceExcludes, false)
+}
+
+func sourceStateAtWithOptions(ctx context.Context, root, relative string, sourceExcludes []string, safeLinks bool) (SourceState, error) {
+	excludes, err := checkoutSourceExcludes(filepath.Clean(relative), sourceExcludes)
+	if err != nil {
+		return SourceState{}, err
+	}
 	path, err := checkedSourcePath(root, relative)
 	if err != nil {
 		return SourceState{}, err
@@ -125,7 +138,7 @@ func sourceStateAt(ctx context.Context, root, relative string) (SourceState, err
 		if err != nil {
 			return err
 		}
-		if excluded(rel) {
+		if excluded(rel) || sourcePathExcluded(rel, excludes) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -141,10 +154,20 @@ func sourceStateAt(ctx context.Context, root, relative string) (SourceState, err
 		if err != nil {
 			return err
 		}
-		item := SourceEntry{Path: filepath.ToSlash(rel), Mode: uint32(info.Mode().Perm())}
+		item := SourceEntry{Path: filepath.ToSlash(rel), Mode: sourceEntryMode(info.Mode())}
 		switch {
 		case info.Mode()&os.ModeSymlink != 0:
-			return fmt.Errorf("source sync refuses symlinks: %s", rel)
+			if !safeLinks {
+				return fmt.Errorf("source sync refuses symlinks: %s", rel)
+			}
+			item.Kind = "symlink"
+			item.Target, err = os.Readlink(file)
+			if err != nil {
+				return err
+			}
+			if err = validateSourceLink(ctx, path, file, item.Target, excludes); err != nil {
+				return fmt.Errorf("unsafe source symlink %s: %w", rel, err)
+			}
 		case info.IsDir():
 			item.Kind = "dir"
 		case info.Mode().IsRegular():
@@ -178,12 +201,103 @@ func sourceStateAt(ctx context.Context, root, relative string) (SourceState, err
 	return state, nil
 }
 
+func sourceEntryMode(mode fs.FileMode) uint32 {
+	// Symlink permissions differ on macOS/Linux and are not synchronized by rsync.
+	// A canonical zero keeps identical links equal in manifests and change plans.
+	if mode&fs.ModeSymlink != 0 {
+		return 0
+	}
+	return uint32(mode.Perm())
+}
+
+// Resolve components without traversing a symlink before checking its target.
+// This also checks intermediate aliases, not just the final EvalSymlinks result.
+func validateSourceLink(ctx context.Context, root, file, target string, excludes []string) error {
+	checkTarget := func(parent, target string) error {
+		if filepath.IsAbs(target) || target == "" || strings.ContainsAny(target, "\x00\n\r") {
+			return fmt.Errorf("link target must be a relative path")
+		}
+		lexical := filepath.Join(parent, target)
+		if !within(root, lexical) {
+			return fmt.Errorf("link target escapes the selected source tree")
+		}
+		relative, err := filepath.Rel(root, lexical)
+		if err != nil {
+			return err
+		}
+		if excluded(relative) || sourcePathExcluded(relative, excludes) {
+			return fmt.Errorf("link target is excluded from source sync")
+		}
+		return nil
+	}
+	parent := filepath.Dir(file)
+	if err := checkTarget(parent, target); err != nil {
+		return err
+	}
+	parentRelative, err := filepath.Rel(root, parent)
+	if err != nil {
+		return err
+	}
+	pending := strings.Split(parentRelative+string(filepath.Separator)+target, string(filepath.Separator))
+	current := root
+	links := 0
+	for len(pending) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if current == root {
+				return fmt.Errorf("link target escapes the selected source tree")
+			}
+			current = filepath.Dir(current)
+			continue
+		}
+		next := filepath.Join(current, part)
+		relative, err := filepath.Rel(root, next)
+		if err != nil {
+			return err
+		}
+		if excluded(relative) || sourcePathExcluded(relative, excludes) {
+			return fmt.Errorf("link target traverses an excluded path")
+		}
+		info, err := os.Lstat(next)
+		if err != nil {
+			return fmt.Errorf("link target cannot be resolved: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			links++
+			if links > 255 {
+				return fmt.Errorf("link target is cyclic or has too many symlinks")
+			}
+			linkTarget, err := os.Readlink(next)
+			if err != nil {
+				return err
+			}
+			if err = checkTarget(current, linkTarget); err != nil {
+				return err
+			}
+			pending = append(strings.Split(linkTarget, string(filepath.Separator)), pending...)
+			continue
+		}
+		if !info.IsDir() && (!info.Mode().IsRegular() || len(pending) > 0) {
+			return fmt.Errorf("link target must resolve through directories to a file or directory")
+		}
+		current = next
+	}
+	return nil
+}
+
 // SourceFingerprint is used by the deployed VM binary; no shell embeds source contents.
 func SourceFingerprint(ctx context.Context, c Config, path string) (SourceState, error) {
 	if c.Workspace.Host != "" {
 		return SourceState{}, fmt.Errorf("source fingerprint runs on the VM")
 	}
-	return sourceStateAt(ctx, c.Workspace.VMRoot, path)
+	return sourceStateAtWithOptions(ctx, c.Workspace.VMRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks)
 }
 
 func PrepareSourceDestination(ctx context.Context, c Config, path, expected string) error {
@@ -203,12 +317,12 @@ func PrepareSourceDestination(ctx context.Context, c Config, path, expected stri
 
 func remoteSourceState(ctx context.Context, c Config, path string) (SourceState, error) {
 	if c.Workspace.Host == "" {
-		return sourceStateAt(ctx, c.Workspace.VMRoot, path)
+		return sourceStateAtWithOptions(ctx, c.Workspace.VMRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks)
 	}
 	if c.Workspace.RemoteDir == "" {
 		return SourceState{}, fmt.Errorf("run setup before source sync")
 	}
-	args := []string{filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox"), "source", "fingerprint", "--config", filepath.Join(c.Workspace.RemoteDir, "config.json"), "--path", path}
+	args := remoteSourceArgs(c, "fingerprint", path)
 	b, err := Output(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false))
 	if err != nil {
 		return SourceState{}, fmt.Errorf("remote source fingerprint: %w", err)
@@ -223,8 +337,14 @@ func remoteSourceState(ctx context.Context, c Config, path string) (SourceState,
 	return state, nil
 }
 
+func remoteSourceArgs(c Config, action, path string) []string {
+	// Always override the deployed config, including an explicitly empty list.
+	excludes, _ := canonicalSourceExcludes(c.Workspace.SourceExcludes)
+	return []string{filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox"), "source", action, "--config", filepath.Join(c.Workspace.RemoteDir, "config.json"), "--path", path, "--vm-root", c.Workspace.VMRoot, "--source-excludes", JSONString(excludes), "--source-safe-links=" + strconv.FormatBool(c.Workspace.SourceSafeLinks)}
+}
+
 func sourceSyncStates(ctx context.Context, c Config, path, direction string) (SourceState, SourceState, error) {
-	local, err := sourceStateAt(ctx, c.Workspace.LocalRoot, path)
+	local, err := sourceStateAtWithOptions(ctx, c.Workspace.LocalRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks)
 	if err != nil {
 		return SourceState{}, SourceState{}, err
 	}
@@ -321,6 +441,8 @@ func PreviewSourceSync(ctx context.Context, c Config, direction, path string, re
 		return fmt.Errorf("selected source checkout does not exist")
 	}
 	plan := SourceSyncPlan{Version: 1, WorkspaceID: c.Workspace.ID, Host: c.Workspace.Host, VMRoot: c.Workspace.VMRoot, LocalRoot: c.Workspace.LocalRoot, RelativePath: path, Direction: direction, Delete: remove, SourceHash: source.Hash, DestinationHash: destination.Hash, Changes: sourceChanges(source, destination, remove)}
+	plan.SourceExcludes, _ = canonicalSourceExcludes(c.Workspace.SourceExcludes)
+	plan.SourceSafeLinks = c.Workspace.SourceSafeLinks
 	b, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		return err
@@ -375,6 +497,10 @@ func canonicalSourcePlanPath(path string) (string, error) {
 }
 
 func sourceSyncCommand(c Config, plan SourceSyncPlan) (Command, error) {
+	excludes, err := checkoutSourceExcludes(plan.RelativePath, c.Workspace.SourceExcludes)
+	if err != nil {
+		return Command{}, err
+	}
 	local, err := checkedSourcePath(c.Workspace.LocalRoot, plan.RelativePath)
 	if err != nil {
 		return Command{}, err
@@ -395,7 +521,15 @@ func sourceSyncCommand(c Config, plan SourceSyncPlan) (Command, error) {
 	}
 	command := runnerRsyncCommand(source, destination)
 	args := []string{"--omit-dir-times", "--itemize-changes"}
+	for _, exclude := range excludes {
+		// Anchored literal filters match a file or directory and protect it from --delete.
+		args = append(args, "--exclude=/"+exclude)
+	}
 	for _, arg := range command.Args {
+		if arg == "--no-links" && c.Workspace.SourceSafeLinks {
+			args = append(args, "--links")
+			continue
+		}
 		if arg == "--delete-delay" && !plan.Delete {
 			continue
 		}
@@ -432,6 +566,17 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	}
 	if plan.Version != 1 || plan.WorkspaceID != c.Workspace.ID || plan.Host != c.Workspace.Host || plan.VMRoot != c.Workspace.VMRoot || plan.LocalRoot != c.Workspace.LocalRoot {
 		return fmt.Errorf("source plan belongs to a different workspace configuration")
+	}
+	currentExcludes, _ := canonicalSourceExcludes(c.Workspace.SourceExcludes)
+	planExcludes, err := canonicalSourceExcludes(plan.SourceExcludes)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(currentExcludes, planExcludes) {
+		return fmt.Errorf("source exclusions changed since preview; generate a new plan")
+	}
+	if plan.SourceSafeLinks != c.Workspace.SourceSafeLinks {
+		return fmt.Errorf("source safe link mode changed since preview; generate a new plan")
 	}
 	path, err := sourceRelativePath(plan.RelativePath)
 	if err != nil {
@@ -487,7 +632,7 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 			return err
 		}
 	} else {
-		args := []string{filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox"), "source", "prepare", "--config", filepath.Join(c.Workspace.RemoteDir, "config.json"), "--path", path, "--expected-hash", destination.Hash}
+		args := append(remoteSourceArgs(c, "prepare", path), "--expected-hash", destination.Hash)
 		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false), nil, io.Discard, w); err != nil {
 			return err
 		}

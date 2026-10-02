@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +28,7 @@ func runnerSyncTransport(c Config, p Project) string {
 
 func runnerRsyncCommand(source, destination Endpoint) Command {
 	args := []string{"-az", "--checksum", "--safe-links", "--no-links", "--delete-delay"}
-	for _, pattern := range []string{".stealthbox-runner", ".git", ".env*", "node_modules", "vendor", ".serena", ".claude", ".codex", ".agents", ".opencode", ".kimi-code"} {
+	for _, pattern := range []string{".stealthbox-runner", ".stealthbox-qa", ".git", ".env*", "node_modules", "vendor", ".serena", ".claude", ".codex", ".agents", ".opencode", ".kimi-code"} {
 		args = append(args, "--exclude="+pattern)
 	}
 	ssh := []string{"ssh", "-o", "BatchMode=yes"}
@@ -69,10 +70,15 @@ func PullRunner(ctx context.Context, c Config, source Endpoint, destination stri
 	dryArgs = append(dryArgs, "--dry-run", "--stats")
 	dryArgs = append(dryArgs, cmd.Args[len(cmd.Args)-3:]...)
 	var statsOutput strings.Builder
-	err := executeRunnerSync(ctx, Command{"env", append([]string{"LC_ALL=C", "rsync"}, dryArgs...)}, &statsOutput, stderr)
+	var capturedStderr runnerSyncErrorOutput
+	stderrSink := io.Writer(&capturedStderr)
+	if stderr != nil {
+		stderrSink = io.MultiWriter(stderr, &capturedStderr)
+	}
+	err := executeRunnerSync(ctx, Command{"env", append([]string{"LC_ALL=C", "rsync"}, dryArgs...)}, &statsOutput, stderrSink)
 	stats := []byte(statsOutput.String())
 	if err != nil {
-		return fmt.Errorf("rsync source preflight: %w", err)
+		return runnerSyncFailure("rsync source preflight", err, &capturedStderr)
 	}
 	match := rsyncTotalSizeRE.FindStringSubmatch(string(stats))
 	if len(match) != 2 {
@@ -86,8 +92,14 @@ func PullRunner(ctx context.Context, c Config, source Endpoint, destination stri
 	if size > max {
 		return fmt.Errorf("rsync selected source exceeds %d bytes", max)
 	}
-	if err = executeRunnerSync(ctx, cmd, io.Discard, stderr); err != nil {
-		return fmt.Errorf("rsync source pull: %w", err)
+	// Apple's --no-links can leave dangling receiver links and fail deleting their
+	// parent directory. Only unprotected disposable links are removed, never targets.
+	if err = removeUnprotectedRunnerSymlinks(ctx, destination); err != nil {
+		return fmt.Errorf("runner symlink cleanup: %w", err)
+	}
+	capturedStderr.data = nil
+	if err = executeRunnerSync(ctx, cmd, io.Discard, stderrSink); err != nil {
+		return runnerSyncFailure("rsync source pull", err, &capturedStderr)
 	}
 	// Source may change during rsync. Refuse command execution if the resulting
 	// checkout exceeds the limit; dependency caches and secret files are excluded.
@@ -127,6 +139,58 @@ func PullRunner(ctx context.Context, c Config, source Endpoint, destination stri
 		}
 		return nil
 	})
+}
+
+func removeUnprotectedRunnerSymlinks(ctx context.Context, destination string) error {
+	root, err := os.OpenRoot(destination)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return fs.WalkDir(root.FS(), ".", func(relative string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if excluded(relative) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return root.Remove(relative)
+		}
+		return nil
+	})
+}
+
+const runnerSyncErrorOutputLimit = 8192
+
+// Keep the final diagnostics, where rsync reports the failed operation/status.
+type runnerSyncErrorOutput struct{ data []byte }
+
+func (output *runnerSyncErrorOutput) Write(data []byte) (int, error) {
+	length := len(data)
+	if length >= runnerSyncErrorOutputLimit {
+		output.data = append(output.data[:0], data[length-runnerSyncErrorOutputLimit:]...)
+	} else {
+		if overflow := len(output.data) + length - runnerSyncErrorOutputLimit; overflow > 0 {
+			output.data = output.data[overflow:]
+		}
+		output.data = append(output.data, data...)
+	}
+	return length, nil
+}
+
+func runnerSyncFailure(stage string, err error, output *runnerSyncErrorOutput) error {
+	diagnostic := strings.TrimSpace(string(output.data))
+	if diagnostic == "" {
+		return fmt.Errorf("%s: %w", stage, err)
+	}
+	return fmt.Errorf("%s: %w; stderr: %s", stage, err, diagnostic)
 }
 
 func executeRunnerSync(ctx context.Context, command Command, stdout, stderr io.Writer) error {

@@ -1,0 +1,62 @@
+services:
+  app:
+    image: ${QA_APP_IMAGE}
+    pull_policy: never
+    working_dir: /app
+    entrypoint: []
+    env_file: dummy.env
+    volumes:
+      - type: bind
+        source: ${QA_CHECKOUT}
+        target: /app
+      - type: bind
+        source: ${QA_HELPERS}
+        target: /qa
+        read_only: true
+    extra_hosts:
+      - dns.quad9.net:9.9.9.9
+    networks: [qa]
+  pgsql:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: qa
+      POSTGRES_PASSWORD: qa-only-not-secret
+      POSTGRES_DB: sms-service
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    networks: [qa]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U qa -d sms-service']
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  redis:
+    image: redis:6.2.16
+    command: [redis-server, --save, '', --appendonly, 'no']
+    networks: [qa]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: qa
+      CLICKHOUSE_PASSWORD: qa-only-not-secret
+      CLICKHOUSE_DB: qa
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+    networks: [qa]
+    healthcheck:
+      test: [CMD, clickhouse-client, --user, qa, --password, qa-only-not-secret, --query, SELECT 1]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+networks:
+  qa:
+    internal: true
+volumes:
+  postgres:
+  clickhouse:
