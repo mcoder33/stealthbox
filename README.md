@@ -61,7 +61,45 @@ go install github.com/mcoder33/stealthbox/cmd/stealthbox@latest
 Нужен Go 1.24+. Добавь `$(go env GOPATH)/bin` в `PATH`. Без Go скачай бинарник
 своей платформы из [Releases](https://github.com/mcoder33/stealthbox/releases/latest),
 проверь по `checksums.txt`, сделай исполняемым и помести в свой `PATH`.
-Поддерживаются **macOS/Linux, ARM64/AMD64**; Windows пока не поддерживается.
+В релизе есть **macOS, Linux и Windows, ARM64/AMD64**. macOS/Linux работают
+нативно; Windows `.exe` запускает встроенный Linux-бинарник через **WSL 2**.
+
+#### Windows
+
+Один раз установи WSL 2 с Ubuntu из PowerShell и закончи создание Linux-пользователя:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+В Ubuntu установи зависимости:
+
+```sh
+sudo apt update
+sudo apt install openssh-client rsync
+```
+
+Скачай `stealthbox-windows-amd64.exe` для x64 или `stealthbox-windows-arm64.exe`
+для ARM64 из Releases, проверь SHA-256 и запусти в Windows Terminal:
+
+```powershell
+.\stealthbox-windows-amd64.exe
+```
+
+Linux-бинарники уже встроены в `.exe`, скачивать их отдельно не нужно.
+SSH-ключи, `~/.ssh/config`, настройки Stealth Box и пути локального исполнителя
+находятся **в Ubuntu/WSL**, а не в Windows-профиле. В этой версии исполнитель
+`mac` на Windows означает локальный WSL. Для Docker включи интеграцию Docker
+Desktop с выбранным WSL-дистрибутивом и проверь `docker info` внутри него.
+
+По умолчанию используется стандартный WSL-дистрибутив; другой можно выбрать:
+
+```powershell
+$env:STEALTHBOX_WSL_DISTRO = "Ubuntu"
+```
+
+Программа не устанавливает WSL и не меняет системные права автоматически.
+Полная справка CLI: `stealthbox-windows-amd64.exe help --wsl`.
 
 ### 2. Подготовь ВМ
 
@@ -300,7 +338,7 @@ stealthbox bridge-status
 make test                         # race detector + go vet
 python3 tests/integration/tui.py   # реальный TUI через pseudo-terminal
 make e2e                          # Docker, Compose, SSH, Python 3, Go
-make release VERSION=v0.2.0
+make release VERSION=v0.2.1
 ```
 
 E2E использует временный Linux-контейнер с SSH/tmux и отдельный тестовый ключ.

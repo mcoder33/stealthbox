@@ -3,5 +3,6 @@
 /.serena/
 .DS_Store
 /dist/
+/cmd/stealthbox/_payload/
 __pycache__/
 *.pyc

@@ -3,6 +3,29 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build embedded Linux payloads
+        run: |
+          New-Item -ItemType Directory -Force cmd/stealthbox/_payload
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "linux"
+          $env:GOARCH = "amd64"
+          go build -o cmd/stealthbox/_payload/linux-amd64 ./cmd/stealthbox
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:GOARCH = "arm64"
+          go build -o cmd/stealthbox/_payload/linux-arm64 ./cmd/stealthbox
+      - run: go test ./cmd/stealthbox
+      - run: go vet ./cmd/stealthbox
+      - run: go build -o stealthbox.exe ./cmd/stealthbox
+      - run: .\stealthbox.exe --version
+      - run: .\stealthbox.exe --help
   test:
     strategy:
       matrix:
