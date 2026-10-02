@@ -68,6 +68,12 @@ func resolveRemote(ctx context.Context, c *Config) (string, string, error) {
 	if c.Workspace.RemoteDir == "" {
 		c.Workspace.RemoteDir = filepath.Join(lines[1], ".stealthbox")
 	}
+	if c.Workspace.VMRoot == "~" || strings.HasPrefix(c.Workspace.VMRoot, "~/") {
+		c.Workspace.VMRoot = filepath.Join(lines[1], strings.TrimPrefix(strings.TrimPrefix(c.Workspace.VMRoot, "~"), "/"))
+	}
+	if err = NormalizeLocalWorkspaceRoots(c); err != nil {
+		return "", "", err
+	}
 	if c.Workspace.Name == "" {
 		c.Workspace.Name = "stealthbox"
 	}
@@ -80,7 +86,18 @@ func resolveRemote(ctx context.Context, c *Config) (string, string, error) {
 	return goos, arch, nil
 }
 func remoteConfig(c Config) (Config, error) {
+	if err := EnsureWorkspaceIdentity(&c); err != nil {
+		return Config{}, err
+	}
 	out := c
+	if WorkspaceRootEnabled(c) {
+		out.Workspace.Host = ""
+		if out.Workspace.SyncTransport == "" || out.Workspace.SyncTransport == "auto" {
+			if c.Workspace.Host != "" {
+				out.Workspace.SyncTransport = "rsync"
+			}
+		}
+	}
 	out.Projects = make(map[string]Project)
 	for n, p := range c.Projects {
 		if p.Source.Host != "" && p.Source.Host != c.Workspace.Host {
@@ -215,6 +232,11 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 	}
 	if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "chmod 700 "+Quote(remoteBin)+"; umask 077; mkdir -p "+Quote(filepath.Dir(c.Bridge.RemoteSocket)), false), nil, io.Discard, io.Discard); err != nil {
 		return err
+	}
+	if WorkspaceRootEnabled(*c) {
+		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "umask 077; mkdir -p "+Quote(c.Workspace.VMRoot), false), nil, io.Discard, io.Discard); err != nil {
+			return err
+		}
 	}
 	if err = DeployConfig(ctx, *c); err != nil {
 		return err

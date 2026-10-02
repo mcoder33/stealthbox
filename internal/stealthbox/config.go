@@ -11,11 +11,17 @@ import (
 )
 
 type WorkspaceConfig struct {
-	Host      string    `json:"host"`
-	RemoteDir string    `json:"remote_dir"`
-	Name      string    `json:"name"`
-	Theme     string    `json:"theme,omitempty"`
-	Forwards  []Forward `json:"forwards,omitempty"`
+	VMRoot           string    `json:"vm_root,omitempty"`
+	LocalRoot        string    `json:"local_root,omitempty"`
+	RunnerRoot       string    `json:"runner_root,omitempty"`
+	ID               string    `json:"id,omitempty"`
+	ShellIntegration bool      `json:"shell_integration,omitempty"`
+	SyncTransport    string    `json:"sync_transport,omitempty"`
+	Host             string    `json:"host"`
+	RemoteDir        string    `json:"remote_dir"`
+	Name             string    `json:"name"`
+	Theme            string    `json:"theme,omitempty"`
+	Forwards         []Forward `json:"forwards,omitempty"`
 }
 type Forward struct {
 	Local  int `json:"local"`
@@ -43,6 +49,9 @@ func DefaultConfig() (Config, error) {
 	return Config{Projects: map[string]Project{}, Workspace: WorkspaceConfig{Host: "dev-vm", Name: "stealthbox"}, Bridge: BridgeConfig{Socket: filepath.Join(home, ".config", "stealthbox", "mac.sock"), Token: hex.EncodeToString(token), TimeoutSeconds: 1800, MaxBytes: 1 << 30}, Agents: map[string][]string{"codex": {"codex"}, "claude": {"claude"}, "shell": {"sh", "-c", "exec \"${SHELL:-/bin/sh}\" -l"}}}, nil
 }
 func (c Config) Validate() error {
+	if err := validateWorkspaceRoots(c); err != nil {
+		return err
+	}
 	if c.Workspace.Host != "" && !hostRE.MatchString(c.Workspace.Host) {
 		return fmt.Errorf("invalid workspace SSH alias")
 	}
@@ -105,6 +114,11 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	for _, p := range c.Projects {
+		if dst, ok := p.Runners["mac"]; ok && p.Source.Host == "" && dst.Host == "" && pathsOverlap(p.Source.Path, dst.Path) {
+			return fmt.Errorf("local source and runner directories must not overlap")
+		}
+	}
 	var macRoots []string
 	for _, p := range c.Projects {
 		if e, ok := p.Runners["mac"]; ok {
@@ -113,7 +127,7 @@ func (c Config) Validate() error {
 	}
 	for i, a := range macRoots {
 		for _, b := range macRoots[i+1:] {
-			if within(a, b) || within(b, a) {
+			if pathsOverlap(a, b) {
 				return fmt.Errorf("Mac runner directories must not overlap: %s and %s", a, b)
 			}
 		}
@@ -121,6 +135,9 @@ func (c Config) Validate() error {
 	return nil
 }
 func Save(path string, c Config) error {
+	if err := EnsureWorkspaceIdentity(&c); err != nil {
+		return err
+	}
 	if err := c.Validate(); err != nil {
 		return err
 	}

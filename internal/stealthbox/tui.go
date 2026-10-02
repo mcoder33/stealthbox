@@ -143,22 +143,27 @@ func TUI(ctx context.Context, path string) error {
 		if c.Bridge.Enabled {
 			state = "on"
 		}
-		i, e := choose(ctx, "VM: "+c.Workspace.Host+" · Mac bridge: "+state, []string{"Connect / подключиться", "Projects / проекты", "VM and workspace / настройки ВМ", "Mac runner / доступ к Mac", "Agents / команды агентов", "Import current tmux style / оформление", "Deploy or update on VM / установка", "Doctor / диагностика", "Exit"}, 0)
+		i, e := choose(ctx, "VM: "+c.Workspace.Host+" · Mac bridge: "+state, []string{"Connect / подключиться", "Projects / проекты", "VM and workspace / настройки ВМ", "Mac runner / доступ к Mac", "Agents / команды агентов", "Import current tmux style / оформление", "Deploy or update on VM / установка", "Doctor / диагностика", "Source import/export / перенос исходников", "Exit"}, 0)
 		if e != nil {
 			return e
 		}
-		if i < 0 || i == 8 {
+		if i < 0 || i == 9 {
 			return nil
 		}
 		switch i {
 		case 0:
-			if len(c.Projects) == 0 {
-				fmt.Println("Add a project first.")
+			if len(c.Projects) == 0 && !WorkspaceRootEnabled(c) {
+				fmt.Println("Configure a Projects root or add a project first.")
 				pauseTUI(ctx)
 				continue
 			}
 			names := Names(c)
-			idx, e := choose(ctx, "Choose a project", names, 0)
+			labels := append([]string{}, names...)
+			if WorkspaceRootEnabled(c) {
+				names = append([]string{""}, names...)
+				labels = append([]string{"Whole Projects workspace / все проекты"}, labels...)
+			}
+			idx, e := choose(ctx, "Choose a workspace", labels, 0)
 			if e != nil {
 				return e
 			}
@@ -187,6 +192,12 @@ func TUI(ctx context.Context, path string) error {
 				runners = append(runners, n)
 			}
 			sort.Strings(runners)
+			if name == "" {
+				runners = []string{"vm"}
+				if c.Bridge.Enabled {
+					runners = append(runners, "local")
+				}
+			}
 			ri, e := choose(ctx, "Docker/test runner", runners, 0)
 			if e != nil {
 				return e
@@ -194,11 +205,22 @@ func TUI(ctx context.Context, path string) error {
 			if ri < 0 {
 				continue
 			}
+			si, e := choose(ctx, "Terminal session", []string{"tmux / несколько окон", "shell / обычная консоль"}, 0)
+			if e != nil {
+				return e
+			}
+			if si < 0 {
+				continue
+			}
+			session := "tmux"
+			if si == 1 {
+				session = "shell"
+			}
 			slot, e := prompt(ctx, "Session name (another name = another agent instance)", "main")
 			if e != nil {
 				return e
 			}
-			err = Connect(ctx, &c, path, ConnectOptions{Project: name, Agent: agents[ai], Runner: runners[ri], Slot: slot, Reconnect: true}, os.Stdout, os.Stderr)
+			err = Connect(ctx, &c, path, ConnectOptions{Project: name, Agent: agents[ai], Runner: runners[ri], Slot: slot, Reconnect: true, Session: session}, os.Stdout, os.Stderr)
 			if err != nil {
 				fmt.Println("Error:", err)
 			}
@@ -212,6 +234,7 @@ func TUI(ctx context.Context, path string) error {
 		case 2:
 			next := cloneConfig(c)
 			oldHost := next.Workspace.Host
+			oldRoot := next.Workspace.VMRoot
 			next.Workspace.Host, err = prompt(ctx, "SSH alias", c.Workspace.Host)
 			if err == nil {
 				next.Workspace.Name, err = prompt(ctx, "Workspace name", c.Workspace.Name)
@@ -220,7 +243,49 @@ func TUI(ctx context.Context, path string) error {
 				next.Workspace.RemoteDir, err = prompt(ctx, "Remote state directory (empty = detect HOME)", c.Workspace.RemoteDir)
 			}
 			if err == nil {
+				selected := 0
+				if WorkspaceRootEnabled(next) {
+					selected = 1
+				}
+				mode, e := choose(ctx, "Workspace mode", []string{"Configured projects only", "Whole Projects root"}, selected)
+				if e != nil {
+					return e
+				}
+				if mode < 0 {
+					continue
+				}
+				if mode == 0 {
+					next.Workspace.VMRoot = ""
+				} else {
+					next.Workspace.VMRoot, err = prompt(ctx, "Projects root on VM (~ belongs to VM)", envDefaultValue(next.Workspace.VMRoot, "~/Projects"))
+					if err == nil {
+						next.Workspace.LocalRoot, err = prompt(ctx, "Local source root (explicit import/export only)", envDefaultValue(next.Workspace.LocalRoot, "~/Projects"))
+					}
+					if err == nil {
+						next.Workspace.RunnerRoot, err = prompt(ctx, "Separate disposable local runner root", envDefaultValue(next.Workspace.RunnerRoot, "~/.local/share/stealthbox/runners"))
+					}
+					if err == nil {
+						next.Workspace.SyncTransport, err = prompt(ctx, "Runner sync: auto, rsync or archive", envDefaultValue(next.Workspace.SyncTransport, "auto"))
+					}
+					if err == nil {
+						value := 0
+						if next.Workspace.ShellIntegration {
+							value = 1
+						}
+						choice, e := choose(ctx, "Managed shell codex/claude commands", []string{"Use explicit stealthbox agent commands", "Wrap codex and claude in this shell"}, value)
+						if e != nil {
+							return e
+						}
+						if choice < 0 {
+							continue
+						}
+						next.Workspace.ShellIntegration = choice == 1
+					}
+				}
+			}
+			if err == nil {
 				if oldHost != next.Workspace.Host {
+					next.Workspace.ID = ""
 					next.Workspace.RemoteDir = ""
 					next.Bridge.RemoteSocket = ""
 					for n, p := range next.Projects {
@@ -233,7 +298,13 @@ func TUI(ctx context.Context, path string) error {
 						}
 					}
 				}
-				err = Save(path, next)
+				if oldRoot != next.Workspace.VMRoot {
+					next.Workspace.ID = ""
+				}
+				err = NormalizeLocalWorkspaceRoots(&next)
+				if err == nil {
+					err = Save(path, next)
+				}
 			}
 			if err == nil {
 				c = next
@@ -365,8 +436,52 @@ func TUI(ctx context.Context, path string) error {
 				fmt.Println(err)
 			}
 			pauseTUI(ctx)
+		case 8:
+			err = sourceSyncTUI(ctx, c, path)
+			if err != nil {
+				fmt.Println("Error:", err)
+				pauseTUI(ctx)
+			}
 		}
 	}
+}
+
+func sourceSyncTUI(ctx context.Context, c Config, configPath string) error {
+	if !WorkspaceRootEnabled(c) {
+		return fmt.Errorf("configure a Whole Projects workspace first")
+	}
+	i, err := choose(ctx, "Source files: preview first, explicit apply; VM remains authoritative", []string{"Import local → VM", "Export VM → local", "Apply an existing reviewed plan", "Back"}, 0)
+	if err != nil || i < 0 || i == 3 {
+		return err
+	}
+	planFile, err := prompt(ctx, "Local plan file", filepath.Join(filepath.Dir(configPath), "source-plan.json"))
+	if err != nil {
+		return err
+	}
+	if i == 2 {
+		return ApplySourceSync(ctx, c, planFile, os.Stdout)
+	}
+	checkout, err := prompt(ctx, "Checkout path relative to Projects (for example team/repo)", "")
+	if err != nil {
+		return err
+	}
+	deletion, err := choose(ctx, "Files only present at destination", []string{"Keep them", "Include deletion in the reviewed plan"}, 0)
+	if err != nil || deletion < 0 {
+		return err
+	}
+	direction := "import"
+	if i == 1 {
+		direction = "export"
+	}
+	if err = PreviewSourceSync(ctx, c, direction, checkout, deletion == 1, planFile, os.Stdout); err != nil {
+		return err
+	}
+	pauseTUI(ctx)
+	apply, err := choose(ctx, "Preview saved; both sides will be checked again before apply", []string{"Keep preview / back", "Apply this reviewed plan"}, 0)
+	if err != nil || apply != 1 {
+		return err
+	}
+	return ApplySourceSync(ctx, c, planFile, os.Stdout)
 }
 func editProject(ctx context.Context, c *Config, path string) error {
 	next := cloneConfig(*c)

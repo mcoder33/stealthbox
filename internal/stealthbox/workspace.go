@@ -22,17 +22,11 @@ func WindowName(project, agent, runner, slot string, extra []string) string {
 	return base
 }
 func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, runner, slot string, extra []string, attach bool, stdout, stderr io.Writer) error {
-	p, ok := c.Projects[project]
-	if !ok {
-		return fmt.Errorf("unknown project")
+	launch, err := resolveWorkspaceLaunch(ctx, c, project, agent, runner)
+	if err != nil {
+		return err
 	}
-	if p.Source.Host != "" {
-		return fmt.Errorf("workspace command runs on the VM; use connect on the Mac")
-	}
-	agent, runner = Defaults(p, agent, runner)
-	if _, ok = p.Runners[runner]; !ok {
-		return fmt.Errorf("unknown runner")
-	}
+	agent, runner = launch.agent, launch.runner
 	if slot == "" {
 		slot = "main"
 	}
@@ -46,13 +40,11 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 	if name == "" {
 		name = "stealthbox"
 	}
-	window := WindowName(project, agent, runner, slot, extra)
-	cmd, err := AgentCommand(c, configPath, project, agent, runner, extra)
+	window := WindowName(launch.label, agent, runner, slot, extra)
+	environment, err := workspaceLaunchScript(c, configPath, launch, extra)
 	if err != nil {
 		return err
 	}
-	// Use the same login shell PATH as a normal interactive session, without copying agent credentials.
-	environment := "export PATH=" + Quote(filepath.Dir(mustExecutable())) + ":\"$PATH\" STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(project) + " STEALTHBOX_RUNNER=" + Quote(runner) + " STEALTHBOX_AGENT=" + Quote(agent) + "; exec " + shellArgs(cmd)
 	tmuxArgs := []string{"-L", "stealthbox"}
 	theme := filepath.Join(c.Workspace.RemoteDir, "tmux.conf")
 	if _, e := os.Stat(theme); e == nil {
@@ -62,7 +54,7 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 		return Output(ctx, Command{"tmux", append(append([]string{}, tmuxArgs...), args...)})
 	}
 	if _, err = invoke("has-session", "-t", name); err != nil {
-		if _, err = invoke("new-session", "-d", "-s", name, "-n", window, "-c", p.Source.Path, environment); err != nil {
+		if _, err = invoke("new-session", "-d", "-s", name, "-n", window, "-c", launch.directory, environment); err != nil {
 			return fmt.Errorf("create tmux workspace: %w", err)
 		}
 	} else {
@@ -77,9 +69,26 @@ func WorkspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 			}
 		}
 		if !found {
-			if _, err = invoke("new-window", "-t", name, "-n", window, "-c", p.Source.Path, environment); err != nil {
+			if _, err = invoke("new-window", "-t", name, "-n", window, "-c", launch.directory, environment); err != nil {
 				return err
 			}
+		}
+	}
+	if launch.scope == "workspace" {
+		// Session-scoped defaults also reach ordinary new windows and split panes.
+		defaults := launch
+		defaults.agent, defaults.binding = "shell", ""
+		defaultScript, e := workspaceLaunchScript(c, configPath, defaults, nil)
+		if e != nil {
+			return e
+		}
+		for key, value := range map[string]string{"STEALTHBOX_CONFIG": configPath, "STEALTHBOX_SCOPE": "workspace", "STEALTHBOX_PROJECT": "", "STEALTHBOX_RUNNER": runner, "STEALTHBOX_VM_ROOT": c.Workspace.VMRoot, "PATH": filepath.Dir(mustExecutable()) + ":" + os.Getenv("PATH")} {
+			if _, e = invoke("set-environment", "-t", name, key, value); e != nil {
+				return e
+			}
+		}
+		if _, e = invoke("set-option", "-t", name, "default-command", defaultScript); e != nil {
+			return e
 		}
 	}
 	if _, err = invoke("select-window", "-t", name+":"+window); err != nil {
@@ -128,14 +137,13 @@ func ThemeSnapshot(ctx context.Context) ([]byte, error) {
 }
 
 func PlainRemote(ctx context.Context, c Config, configPath, project, agent, runner string, extra []string, stdout, stderr io.Writer) error {
-	p, ok := c.Projects[project]
-	if !ok || p.Source.Host != "" {
-		return fmt.Errorf("plain session must run on source VM")
-	}
-	cmd, err := AgentCommand(c, configPath, project, agent, runner, extra)
+	launch, err := resolveWorkspaceLaunch(ctx, c, project, agent, runner)
 	if err != nil {
 		return err
 	}
-	script := "cd " + Quote(p.Source.Path) + " && export PATH=" + Quote(filepath.Dir(mustExecutable())) + ":\"$PATH\" STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(project) + " STEALTHBOX_RUNNER=" + Quote(runner) + " && exec " + shellArgs(cmd)
-	return ExecuteContext(ctx, At(p.Source, script, false), os.Stdin, stdout, stderr)
+	script, err := workspaceLaunchScript(c, configPath, launch, extra)
+	if err != nil {
+		return err
+	}
+	return ExecuteContext(ctx, At(Endpoint{}, "cd "+Quote(launch.directory)+" && "+script, false), os.Stdin, stdout, stderr)
 }

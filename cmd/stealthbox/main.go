@@ -72,6 +72,19 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	parseArgs := args[1:]
+	positionalAgent, sourceAction := "", ""
+	if args[0] == "agent" || args[0] == "source" {
+		if len(parseArgs) == 0 || strings.HasPrefix(parseArgs[0], "-") {
+			return fmt.Errorf("%s needs a name before its flags", args[0])
+		}
+		if args[0] == "agent" {
+			positionalAgent = parseArgs[0]
+		} else {
+			sourceAction = parseArgs[0]
+		}
+		parseArgs = parseArgs[1:]
+	}
 	config := f.String("config", def, "configuration path")
 	project := f.String("project", os.Getenv("STEALTHBOX_PROJECT"), "project name")
 	runner := f.String("runner", os.Getenv("STEALTHBOX_RUNNER"), "runner name")
@@ -82,20 +95,57 @@ func run(ctx context.Context, args []string) error {
 	host := f.String("host", "", "SSH config alias")
 	remoteDir := f.String("remote-dir", "", "remote state directory")
 	binary := f.String("binary", "", "prebuilt remote binary for offline setup")
-	sourcePath := f.String("path", "", "absolute project source path on VM")
+	sourcePath := f.String("path", "", "checkout path (VM absolute or workspace relative)")
+	vmRoot := f.String("vm-root", "", "VM Projects root; ~ is expanded on the VM during setup")
+	localRoot := f.String("local-root", "", "local Projects root for explicit source import/export")
+	runnerRoot := f.String("runner-root", "", "separate disposable local runner root")
+	syncTransport := f.String("sync-transport", "", "auto, rsync or archive")
+	shellIntegration := f.Bool("shell-integration", false, "wrap codex/claude only in the managed workspace shell")
+	plan := f.String("plan", "", "reviewed source sync plan file")
+	expectedHash := f.String("expected-hash", "", "expected destination fingerprint (internal source prepare)")
 	macPath := f.String("mac-path", "", "dedicated disposable Mac runner path")
 	remove := f.Bool("delete", false, "remove project from config; keep files")
 	enableMac := f.Bool("enable-mac", false, "enable Mac runner bridge")
 	allowExec := f.Bool("allow-mac-exec", false, "enable direct Mac command execution")
 	on := f.String("on", "vm", "execution host: vm or mac")
-	cwd := f.String("cwd", "", "Mac directory relative to runner root")
+	cwd := f.String("cwd", "", "command directory relative to the selected checkout")
 	noAttach := f.Bool("no-attach", false, "create/select window without attaching (VM command)")
 	reconnect := f.Bool("reconnect", true, "reconnect after SSH transport failure")
 	artifact := f.String("file", "", "artifact path relative to Mac runner")
 	output := f.String("output", "", "local output file (must not exist)")
 	edit := f.Bool("edit", false, "edit config with EDITOR")
-	if err = f.Parse(args[1:]); err != nil {
+	if err = f.Parse(parseArgs); err != nil {
 		return err
+	}
+	visited := map[string]bool{}
+	f.Visit(func(value *flag.Flag) { visited[value.Name] = true })
+	applyWorkspaceFlags := func(c *stealthbox.Config) error {
+		oldHost, oldRoot := c.Workspace.Host, c.Workspace.VMRoot
+		if visited["host"] {
+			c.Workspace.Host = *host
+		}
+		if visited["remote-dir"] {
+			c.Workspace.RemoteDir = *remoteDir
+		}
+		if visited["vm-root"] {
+			c.Workspace.VMRoot = *vmRoot
+		}
+		if visited["local-root"] {
+			c.Workspace.LocalRoot = *localRoot
+		}
+		if visited["runner-root"] {
+			c.Workspace.RunnerRoot = *runnerRoot
+		}
+		if visited["sync-transport"] {
+			c.Workspace.SyncTransport = *syncTransport
+		}
+		if visited["shell-integration"] {
+			c.Workspace.ShellIntegration = *shellIntegration
+		}
+		if oldHost != c.Workspace.Host || oldRoot != c.Workspace.VMRoot {
+			c.Workspace.ID = ""
+		}
+		return stealthbox.NormalizeLocalWorkspaceRoots(c)
 	}
 	switch args[0] {
 	case "init":
@@ -110,16 +160,13 @@ func run(ctx context.Context, args []string) error {
 		if e != nil {
 			return e
 		}
-		if *host != "" {
-			c.Workspace.Host = *host
-		}
-		if *remoteDir != "" {
-			c.Workspace.RemoteDir = *remoteDir
+		if e = applyWorkspaceFlags(&c); e != nil {
+			return e
 		}
 		c.Bridge.Enabled = *enableMac
 		c.Bridge.AllowExec = *allowExec
 		if err = stealthbox.Save(*config, c); err == nil {
-			fmt.Println("Created", *config, "(mode 0600). Use stealthbox tui to add projects.")
+			fmt.Println("Created", *config, "(mode 0600). Use stealthbox tui to configure a Projects workspace or add projects.")
 		}
 		return err
 	case "tui":
@@ -132,11 +179,8 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *host != "" {
-		c.Workspace.Host = *host
-	}
-	if *remoteDir != "" {
-		c.Workspace.RemoteDir = *remoteDir
+	if err = applyWorkspaceFlags(&c); err != nil {
+		return err
 	}
 	switch args[0] {
 	case "config":
@@ -158,11 +202,26 @@ func run(ctx context.Context, args []string) error {
 			_, err = stealthbox.Load(*config)
 			return err
 		}
+		changed := false
+		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration"} {
+			changed = changed || visited[name]
+		}
+		if changed {
+			if *dry {
+				return c.Validate()
+			}
+			if err = stealthbox.Save(*config, c); err != nil {
+				return err
+			}
+		}
 		c.Bridge.Token = "[redacted]"
 		b, _ := json.MarshalIndent(c, "", "  ")
 		fmt.Println(string(b))
 		return nil
 	case "list":
+		if stealthbox.WorkspaceRootEnabled(c) {
+			fmt.Printf("workspace\t%s\t%s\n", c.Workspace.Host, c.Workspace.VMRoot)
+		}
 		for _, n := range stealthbox.Names(c) {
 			p := c.Projects[n]
 			a, r := stealthbox.Defaults(p, "", "")
@@ -276,19 +335,74 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.ServeMCP(ctx, c, os.Stdin, os.Stdout)
+	case "source":
+		switch sourceAction {
+		case "import", "export":
+			if *dry {
+				fmt.Printf("Would preview %s %s without changing source files; plan=%s delete=%t\n", sourceAction, *sourcePath, *plan, *remove)
+				return nil
+			}
+			return stealthbox.PreviewSourceSync(ctx, c, sourceAction, *sourcePath, *remove, *plan, os.Stdout)
+		case "apply":
+			if *dry {
+				fmt.Println("Would validate and apply the reviewed source plan", *plan)
+				return nil
+			}
+			return stealthbox.ApplySourceSync(ctx, c, *plan, os.Stdout)
+		case "fingerprint":
+			state, e := stealthbox.SourceFingerprint(ctx, c, *sourcePath)
+			if e != nil {
+				return e
+			}
+			return json.NewEncoder(os.Stdout).Encode(state)
+		case "prepare":
+			if *dry {
+				return fmt.Errorf("--dry-run cannot prepare a source destination")
+			}
+			return stealthbox.PrepareSourceDestination(ctx, c, *sourcePath, *expectedHash)
+		default:
+			return fmt.Errorf("source action must be import, export or apply")
+		}
 	}
-	if *project == "" {
+	if *sourcePath != "" {
+		if visited["project"] && *project != "" && *project != *sourcePath {
+			return fmt.Errorf("choose --project or --path")
+		}
+		*project = *sourcePath
+		if stealthbox.WorkspaceRootEnabled(c) {
+			if (args[0] == "connect" || args[0] == "open") && !filepath.IsAbs(c.Workspace.VMRoot) {
+				if !filepath.IsAbs(*project) {
+					*project = "./" + *project
+				}
+			} else {
+				*project, err = stealthbox.WorkspaceCheckoutPath(c, *sourcePath)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if *project == "" && !stealthbox.WorkspaceRootEnabled(c) {
 		if len(c.Projects) == 1 {
 			*project = stealthbox.Names(c)[0]
 		} else {
 			return fmt.Errorf("set --project or STEALTHBOX_PROJECT")
 		}
 	}
-	p, ok := c.Projects[*project]
-	if !ok {
-		return fmt.Errorf("unknown project %q", *project)
+	p, configured := c.Projects[*project]
+	if configured {
+		*agent, *runner = stealthbox.Defaults(p, *agent, *runner)
+	} else {
+		if !stealthbox.WorkspaceRootEnabled(c) {
+			return fmt.Errorf("unknown project %q", *project)
+		}
+		if *agent == "" {
+			*agent = "shell"
+		}
+		if *runner == "" {
+			*runner = "vm"
+		}
 	}
-	*agent, *runner = stealthbox.Defaults(p, *agent, *runner)
 	switch args[0] {
 	case "open", "connect":
 		if *session != "tmux" && *session != "shell" {
@@ -308,6 +422,15 @@ func run(ctx context.Context, args []string) error {
 			return stealthbox.PlainRemote(ctx, c, *config, *project, *agent, *runner, f.Args(), os.Stdout, os.Stderr)
 		}
 		return stealthbox.WorkspaceRemote(ctx, c, *config, *project, *agent, *runner, *slot, f.Args(), !*noAttach, os.Stdout, os.Stderr)
+	case "agent":
+		if positionalAgent != "" {
+			*agent = positionalAgent
+		}
+		if *dry {
+			fmt.Printf("Would launch %s at %s with runner=%s and a workspace MCP scope\n", *agent, *project, *runner)
+			return nil
+		}
+		return stealthbox.LaunchAgent(ctx, c, *config, *project, *agent, *runner, f.Args(), os.Stdout, os.Stderr)
 	case "fetch":
 		if *artifact == "" || *output == "" {
 			return fmt.Errorf("fetch needs --file and --output")
@@ -323,7 +446,17 @@ func run(ctx context.Context, args []string) error {
 		if !snapshot {
 			target = *on
 		}
+		if target == "local" {
+			target = "mac"
+		}
+		if target == "remote" {
+			target = "vm"
+		}
 		if *dry {
+			if !configured {
+				fmt.Printf("Workspace runner: path=%s cwd=%s runner=%s sync=%t command=%s\n", *project, *cwd, target, snapshot, stealthbox.JSONString(f.Args()))
+				return nil
+			}
 			dst, ok := p.Runners[target]
 			if !ok {
 				return fmt.Errorf("unknown runner")
@@ -356,24 +489,31 @@ func usage() {
   stealthbox                         Interactive TUI (when stdin/stdout are a terminal)
   stealthbox tui [--config PATH]      Projects, agents, runners, theme, deployment, doctor
   stealthbox init --host dev-vm [--enable-mac] [--allow-mac-exec]
+  stealthbox config --vm-root '~/Projects' --local-root ~/Projects --runner-root ~/.local/share/stealthbox/runners --shell-integration
   stealthbox project --project NAME --path /home/user/project --mac-path /Users/user/runner
   stealthbox setup [--binary PATH]    Deploy binary/config to the VM; detect HOME and platform
   stealthbox theme                    Export current local tmux options/key bindings
   stealthbox connect --project NAME --agent codex --runner mac [--slot main]
+  stealthbox connect                 Open a shell at VM Projects root when vm_root is configured
+  stealthbox agent codex|claude|shell [--path CHECKOUT] [--runner local|vm] -- ARGS
   stealthbox open ...                 Alias for connect; --session shell skips tmux
-  stealthbox run [--runner vm|mac] -- COMMAND [ARGS...]
-  stealthbox exec --on vm|mac [--cwd RELATIVE] -- COMMAND [ARGS...]
+  stealthbox run [--path CHECKOUT] [--cwd RELATIVE] [--runner local|vm] -- COMMAND [ARGS...]
+  stealthbox exec --on vm|local [--path CHECKOUT] [--cwd RELATIVE] -- COMMAND [ARGS...]
   stealthbox fetch --file REL --output PATH   Download a Mac artifact to the VM
   stealthbox doctor                   Check prerequisites and live connectivity
   stealthbox bridge                  Foreground Mac runner + reverse SSH tunnel
   stealthbox bridge-start|bridge-stop|bridge-status  Manage background Mac bridge
   stealthbox config [--edit]          Show redacted config or edit with EDITOR
   stealthbox list                     List projects
+  stealthbox source import|export --path REL --plan FILE [--delete]
+                                     Preview local → VM / VM → local transfer; source files stay unchanged
+  stealthbox source apply --plan FILE Apply reviewed plan only if both sides are unchanged
   stealthbox mcp                      MCP stdio tools (used automatically by Codex/Claude)
 
 All command flags precede -- and command arguments. --dry-run makes no changes.
 Config: STEALTHBOX_CONFIG or ~/.config/stealthbox/config.json.
 Project/runner defaults: STEALTHBOX_PROJECT / STEALTHBOX_RUNNER.
+Workspace mode permits per-call checkout paths; local sources and disposable runners stay separate.
 Connect from a terminal OUTSIDE your local tmux. On the VM, tmux uses its own
 stealthbox socket and never modifies unrelated sessions or agent credentials.`)
 }

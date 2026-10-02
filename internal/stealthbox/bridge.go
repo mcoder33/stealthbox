@@ -25,10 +25,13 @@ type ExitError struct{ Code int }
 func (e *ExitError) Error() string { return fmt.Sprintf("command exited with status %d", e.Code) }
 
 type RunRequest struct {
-	Project string   `json:"project"`
-	Args    []string `json:"args"`
-	Sync    bool     `json:"sync"`
-	CWD     string   `json:"cwd,omitempty"`
+	WorkspaceID string   `json:"workspace_id,omitempty"`
+	Path        string   `json:"path,omitempty"`
+	Transport   string   `json:"transport,omitempty"`
+	Project     string   `json:"project"`
+	Args        []string `json:"args"`
+	Sync        bool     `json:"sync"`
+	CWD         string   `json:"cwd,omitempty"`
 }
 type Event struct {
 	Stream string `json:"stream"`
@@ -66,10 +69,7 @@ func limits(c Config) (int64, time.Duration) {
 	return m, time.Duration(s) * time.Second
 }
 func BridgeHandler(c Config) http.Handler {
-	locks := map[string]*sync.Mutex{}
-	for n := range c.Projects {
-		locks[n] = &sync.Mutex{}
-	}
+	locks := &runnerLocks{projects: map[string]*sync.Mutex{}}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		supplied := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if len(c.Bridge.Token) < 32 || subtle.ConstantTimeCompare([]byte(supplied), []byte(c.Bridge.Token)) != 1 {
@@ -99,14 +99,22 @@ func BridgeHandler(c Config) http.Handler {
 			http.Error(w, "invalid request", 400)
 			return
 		}
-		p, ok := c.Projects[req.Project]
-		if !ok {
-			http.Error(w, "project is not enabled on this Mac", 403)
+		if _, err := relativeCommandDirectory(req.CWD); err != nil {
+			http.Error(w, err.Error(), 400)
 			return
 		}
+		_, operationTimeout := limits(c)
+		operationCtx, cancel := context.WithTimeout(r.Context(), operationTimeout)
+		defer cancel()
+		resolved, err := resolveBridgeProject(operationCtx, c, req)
+		if err != nil {
+			http.Error(w, err.Error(), 403)
+			return
+		}
+		p := resolved.Project
 		dst, ok := p.Runners["mac"]
 		if !ok || dst.Host != "" || dst.Bridge {
-			http.Error(w, "Mac runner is not local", 400)
+			http.Error(w, "local runner is unavailable", 400)
 			return
 		}
 		if len(req.Args) == 0 || len(req.Args) > 256 {
@@ -123,19 +131,38 @@ func BridgeHandler(c Config) http.Handler {
 			http.Error(w, "direct Mac execution is disabled; enable allow_exec locally", 403)
 			return
 		}
-		lock := locks[req.Project]
+		lock := locks.forProject(resolved.ID)
 		if !lock.TryLock() {
 			http.Error(w, "another command is using this runner", 409)
 			return
 		}
 		defer lock.Unlock()
-		max, timeout := limits(c)
+		max, _ := limits(c)
 		if req.Sync {
-			if err = SyncSnapshot(dst.Path, http.MaxBytesReader(w, r.Body, max+(64<<20)), max); err != nil {
+			transport := req.Transport
+			if transport == "" {
+				transport = "archive"
+			}
+			if transport != "archive" && transport != "rsync" {
+				http.Error(w, "unsupported runner sync transport", 400)
+				return
+			}
+			if c.Workspace.SyncTransport == "rsync" && transport != "rsync" {
+				http.Error(w, "this local runner requires rsync transport", 400)
+				return
+			}
+			if transport == "rsync" {
+				var diagnostic strings.Builder
+				err = PullRunner(operationCtx, c, p.Source, dst.Path, &diagnostic)
+			} else {
+				err = SyncSnapshot(dst.Path, http.MaxBytesReader(w, r.Body, max+(64<<20)), max)
+			}
+			if err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
 		}
+
 		if !req.Sync {
 			if _, e := os.Stat(dst.Path); os.IsNotExist(e) {
 				if e = validateRunnerRoot(dst.Path); e != nil {
@@ -150,12 +177,12 @@ func BridgeHandler(c Config) http.Handler {
 			return
 		}
 		cwd := root
-		if req.CWD != "" {
-			if !filepath.IsLocal(req.CWD) {
+		if resolved.RelativeCWD != "" {
+			if !filepath.IsLocal(resolved.RelativeCWD) {
 				http.Error(w, "cwd must stay inside runner directory", 400)
 				return
 			}
-			cwd, err = filepath.EvalSymlinks(filepath.Join(root, req.CWD))
+			cwd, err = filepath.EvalSymlinks(filepath.Join(root, resolved.RelativeCWD))
 			if err != nil || !within(root, cwd) {
 				http.Error(w, "cwd is outside runner directory or unavailable", 400)
 				return
@@ -169,11 +196,12 @@ func BridgeHandler(c Config) http.Handler {
 		if flusher != nil {
 			flusher.Flush()
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, req.Args[0], req.Args[1:]...)
+		cmd := exec.CommandContext(operationCtx, req.Args[0], req.Args[1:]...)
 		cmd.Dir = cwd
-		cmd.Env = append(os.Environ(), "STEALTHBOX_PROJECT="+req.Project, "STEALTHBOX_RUNNER=mac")
+		cmd.Env = append(os.Environ(), "STEALTHBOX_PROJECT="+resolved.DisplayName, "STEALTHBOX_RUNNER=local")
+		if resolved.StaticName == "" {
+			cmd.Env = append(cmd.Env, "COMPOSE_PROJECT_NAME="+resolved.ID)
+		}
 		cmd.Stdout = eventWriter{mu, enc, flusher, "stdout"}
 		cmd.Stderr = eventWriter{mu, enc, flusher, "stderr"}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -301,17 +329,19 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 	if !c.Bridge.Enabled {
 		return fmt.Errorf("Mac bridge is disabled")
 	}
-	p, ok := c.Projects[name]
-	if !ok {
-		return fmt.Errorf("unknown project")
+	resolved, err := ResolveProject(ctx, c, name, cwd)
+	if err != nil {
+		return err
 	}
+	p := resolved.Project
 	if snapshot && p.Source.Host != "" {
 		return fmt.Errorf("run the bridge client on the source VM")
 	}
+	transport := runnerSyncTransport(c, p)
 	max, _ := limits(c)
 	var body io.Reader
 	var archive *os.File
-	if snapshot {
+	if snapshot && transport == "archive" {
 		var err error
 		archive, err = os.CreateTemp("", "stealthbox-snapshot-*.tar")
 		if err != nil {
@@ -327,7 +357,17 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 		}
 		body = archive
 	}
-	meta, err := json.Marshal(RunRequest{Project: name, Args: args, Sync: snapshot, CWD: cwd})
+	request := RunRequest{Project: resolved.StaticName, Args: args, Sync: snapshot, CWD: resolved.RelativeCWD, Transport: transport}
+	if resolved.StaticName == "" {
+		request.WorkspaceID = c.Workspace.ID
+		if request.WorkspaceID == "" {
+			copyConfig := c
+			_ = EnsureWorkspaceIdentity(&copyConfig)
+			request.WorkspaceID = copyConfig.Workspace.ID
+		}
+		request.Path = resolved.RelativePath
+	}
+	meta, err := json.Marshal(request)
 	if err != nil {
 		return err
 	}
@@ -380,4 +420,60 @@ func configHash(c Config) string {
 	b, _ := json.Marshal(c)
 	h := sha256.Sum256(b)
 	return fmt.Sprintf("%x", h)
+}
+
+// A dynamically discovered checkout has one lock shared by runs and artifacts.
+type runnerLocks struct {
+	mutex    sync.Mutex
+	projects map[string]*sync.Mutex
+}
+
+func (locks *runnerLocks) forProject(id string) *sync.Mutex {
+	locks.mutex.Lock()
+	defer locks.mutex.Unlock()
+	lock := locks.projects[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		locks.projects[id] = lock
+	}
+	return lock
+}
+func resolveBridgeProject(ctx context.Context, c Config, request RunRequest) (ResolvedProject, error) {
+	if request.Project != "" {
+		if _, ok := c.Projects[request.Project]; !ok {
+			return ResolvedProject{}, fmt.Errorf("project is not enabled on this local runner")
+		}
+		return ResolveProject(ctx, c, request.Project, request.CWD)
+	}
+	if !WorkspaceRootEnabled(c) {
+		return ResolvedProject{}, fmt.Errorf("workspace projects are not enabled")
+	}
+	if err := EnsureWorkspaceIdentity(&c); err != nil {
+		return ResolvedProject{}, err
+	}
+	if request.WorkspaceID == "" || request.WorkspaceID != c.Workspace.ID {
+		return ResolvedProject{}, fmt.Errorf("workspace ID is not enabled on this local runner")
+	}
+	if !filepath.IsLocal(request.Path) || request.Path == "." {
+		return ResolvedProject{}, fmt.Errorf("checkout path must be relative to the workspace")
+	}
+	selector, err := WorkspaceCheckoutPath(c, request.Path)
+	if err != nil {
+		return ResolvedProject{}, err
+	}
+	resolved, err := ResolveProject(ctx, c, selector, request.CWD)
+	if err != nil {
+		return ResolvedProject{}, err
+	}
+	if resolved.RelativePath != filepath.ToSlash(filepath.Clean(request.Path)) {
+		return ResolvedProject{}, fmt.Errorf("request must identify the canonical checkout root")
+	}
+	// Config with an empty source host is an archive test/local setup. Its derived
+	// runner is local to this process, not the VM-side bridge client.
+	if c.Workspace.Host == "" {
+		endpoint := resolved.Project.Runners["mac"]
+		endpoint.Bridge = false
+		resolved.Project.Runners["mac"] = endpoint
+	}
+	return resolved, nil
 }

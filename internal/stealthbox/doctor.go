@@ -25,6 +25,32 @@ func Doctor(ctx context.Context, c Config, w io.Writer) error {
 	if c.Bridge.Enabled {
 		check("local Docker", func(ctx context.Context) error { return exec.CommandContext(ctx, "docker", "info").Run() })
 	}
+	if WorkspaceRootEnabled(c) {
+		check("workspace Projects root", func(ctx context.Context) error {
+			if !filepath.IsAbs(c.Workspace.VMRoot) {
+				return fmt.Errorf("run setup to expand VM ~")
+			}
+			_, e := Output(ctx, sshCommand(c.Workspace.Host, "test -d "+Quote(c.Workspace.VMRoot), false))
+			return e
+		})
+		if c.Workspace.SyncTransport == "rsync" || c.Workspace.SyncTransport == "auto" || c.Workspace.SyncTransport == "" {
+			check("local rsync", func(context.Context) error { _, e := exec.LookPath("rsync"); return e })
+			check("VM rsync + Git", func(ctx context.Context) error {
+				_, e := Output(ctx, sshCommand(c.Workspace.Host, "command -v rsync >/dev/null && command -v git >/dev/null", false))
+				return e
+			})
+		}
+		for _, name := range []string{"codex", "claude"} {
+			args := c.Agents[name]
+			if len(args) == 0 {
+				continue
+			}
+			check("workspace agent "+name, func(ctx context.Context) error {
+				_, e := Output(ctx, sshCommand(c.Workspace.Host, "command -v "+Quote(args[0]), false))
+				return e
+			})
+		}
+	}
 	if c.Workspace.Host != "" {
 		check("SSH + remote tmux", func(ctx context.Context) error {
 			_, e := Output(ctx, sshCommand(c.Workspace.Host, "command -v tmux", false))

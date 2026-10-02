@@ -43,10 +43,11 @@ jobs:
       - run: python3 tests/integration/tui.py
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - run: python3 tests/integration/e2e.py
+      - run: python3 tests/integration/workspaces.py

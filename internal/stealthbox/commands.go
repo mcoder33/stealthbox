@@ -187,7 +187,7 @@ func PlanRun(p Project, runner string, args []string) ([]Command, error) {
 			return nil, fmt.Errorf("source and runner directories must not overlap")
 		}
 		cmds = append(cmds, At(dst, "mkdir -p "+Quote(dst.Path)+" && cd "+Quote(dst.Path)+" && { test -f .stealthbox-runner || test -z \"$(ls -A)\"; } && touch .stealthbox-runner", false))
-		cmds = append(cmds, Command{"rsync", []string{"-az", "--delete-delay", "--exclude=.stealthbox-runner", "--exclude=.git", "--exclude=.env", "--exclude=.env.*", "--exclude=node_modules/", "--exclude=vendor/", "--exclude=.serena/", "-e", "ssh -o BatchMode=yes", "--", location(p.Source), location(dst)}})
+		cmds = append(cmds, runnerRsyncCommand(p.Source, dst))
 	}
 	cmds = append(cmds, At(dst, "cd "+Quote(dst.Path)+" && "+shellArgs(args), false))
 	return cmds, nil

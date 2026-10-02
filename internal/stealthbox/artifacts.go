@@ -8,17 +8,17 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 )
 
-func serveFile(w http.ResponseWriter, r *http.Request, c Config, locks map[string]*sync.Mutex) {
+func serveFile(w http.ResponseWriter, r *http.Request, c Config, locks *runnerLocks) {
 	name := r.URL.Query().Get("project")
 	rel := r.URL.Query().Get("path")
-	p, ok := c.Projects[name]
-	if !ok {
-		http.Error(w, "unknown project", 403)
+	resolved, err := resolveBridgeProject(r.Context(), c, RunRequest{Project: name, WorkspaceID: r.URL.Query().Get("workspace_id"), Path: r.URL.Query().Get("checkout")})
+	if err != nil {
+		http.Error(w, err.Error(), 403)
 		return
 	}
+	p := resolved.Project
 	if !filepath.IsLocal(rel) || rel == "." {
 		http.Error(w, "path must be relative to runner directory", 400)
 		return
@@ -28,7 +28,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, c Config, locks map[strin
 		http.Error(w, "Mac runner unavailable", 400)
 		return
 	}
-	lock := locks[name]
+	lock := locks.forProject(resolved.ID)
 	if !lock.TryLock() {
 		http.Error(w, "runner is busy", 409)
 		return
@@ -67,7 +67,20 @@ func Fetch(ctx context.Context, c Config, project, rel, output string) error {
 	if !filepath.IsLocal(rel) || rel == "." {
 		return fmt.Errorf("artifact path must be relative")
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://unix/file?"+url.Values{"project": {project}, "path": {rel}}.Encode(), nil)
+	resolved, err := ResolveProject(ctx, c, project, "")
+	if err != nil {
+		return err
+	}
+	query := url.Values{"project": {resolved.StaticName}, "path": {rel}}
+	if resolved.StaticName == "" {
+		copyConfig := c
+		if err = EnsureWorkspaceIdentity(&copyConfig); err != nil {
+			return err
+		}
+		query.Set("workspace_id", copyConfig.Workspace.ID)
+		query.Set("checkout", resolved.RelativePath)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://unix/file?"+query.Encode(), nil)
 	if err != nil {
 		return err
 	}

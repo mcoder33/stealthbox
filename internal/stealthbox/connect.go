@@ -21,21 +21,34 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 	if os.Getenv("TMUX") != "" {
 		return fmt.Errorf("open Stealth Box in a terminal outside your local tmux to avoid nested prefixes; use a new terminal tab")
 	}
-	if len(c.Projects) == 0 {
+	if len(c.Projects) == 0 && !WorkspaceRootEnabled(*c) {
 		return fmt.Errorf("add a project in stealthbox tui first")
 	}
-	if o.Project == "" {
+	if o.Project == "" && !WorkspaceRootEnabled(*c) {
 		o.Project = Names(*c)[0]
 	}
 	p, ok := c.Projects[o.Project]
-	if !ok {
+	if !ok && !WorkspaceRootEnabled(*c) {
 		return fmt.Errorf("unknown project")
 	}
-	o.Agent, o.Runner = Defaults(p, o.Agent, o.Runner)
+	o.Runner = runnerAlias(o.Runner)
+	if ok {
+		o.Agent, o.Runner = Defaults(p, o.Agent, o.Runner)
+	} else {
+		if o.Agent == "" {
+			o.Agent = "shell"
+		}
+		if o.Runner == "" {
+			o.Runner = "vm"
+		}
+		if o.Runner != "vm" && o.Runner != "mac" {
+			return fmt.Errorf("root workspace runner must be local or vm")
+		}
+	}
 	if o.Runner == "mac" && !c.Bridge.Enabled {
 		return fmt.Errorf("enable the Mac bridge in TUI settings before selecting the Mac runner")
 	}
-	if _, ok = p.Runners[o.Runner]; !ok {
+	if _, configured := p.Runners[o.Runner]; ok && !configured {
 		return fmt.Errorf("runner is not configured")
 	}
 	if c.Workspace.RemoteDir == "" {
@@ -67,7 +80,14 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		argv := []string{remoteBin, "workspace", "--config", remoteCfg, "--project", o.Project, "--agent", o.Agent, "--runner", o.Runner}
+		argv := []string{remoteBin, "workspace", "--config", remoteCfg, "--agent", o.Agent, "--runner", o.Runner}
+		if o.Project != "" {
+			if ok {
+				argv = append(argv, "--project", o.Project)
+			} else {
+				argv = append(argv, "--path", o.Project)
+			}
+		}
 		if o.Session != "" {
 			argv = append(argv, "--session", o.Session)
 		}
