@@ -2,7 +2,6 @@ package stealthbox
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -70,6 +69,8 @@ func limits(c Config) (int64, time.Duration) {
 }
 func BridgeHandler(c Config) http.Handler {
 	locks := &runnerLocks{projects: map[string]*sync.Mutex{}}
+	environment, agentSocket := terminalEnvironment(), localAgentSocket()
+	contextHash := contextConfigHash(c, environment, agentSocket)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		supplied := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if len(c.Bridge.Token) < 32 || subtle.ConstantTimeCompare([]byte(supplied), []byte(c.Bridge.Token)) != 1 {
@@ -78,7 +79,38 @@ func BridgeHandler(c Config) http.Handler {
 		}
 		if r.URL.Path == "/health" && r.Method == "GET" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "allow_exec": c.Bridge.AllowExec, "config_hash": configHash(c)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "allow_exec": c.Bridge.AllowExec, "config_hash": contextHash})
+			return
+		}
+		if r.URL.Path == "/local-context" || r.URL.Path == "/git-credential" || r.URL.Path == "/ssh-agent" || r.URL.Path == "/git-ssh" {
+			if !LocalContextEnabled(c) {
+				http.Error(w, "local terminal context is disabled", http.StatusForbidden)
+				return
+			}
+			if r.URL.Path == "/local-context" && r.Method == "GET" {
+				data, err := json.Marshal(localContextSnapshot{Environment: environment, SSHAgent: agentSocket != ""})
+				if err != nil || len(data) > localContextLimit {
+					http.Error(w, "local terminal context exceeds its limit", http.StatusRequestEntityTooLarge)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Cache-Control", "no-store")
+				_, _ = w.Write(data)
+				return
+			}
+			if r.URL.Path == "/git-credential" && r.Method == "POST" {
+				serveGitCredential(w, r, c)
+				return
+			}
+			if r.URL.Path == "/git-ssh" && r.Method == "POST" {
+				serveGitSSH(w, r, c)
+				return
+			}
+			if r.URL.Path == "/ssh-agent" && r.Method == "CONNECT" {
+				serveLocalAgent(w, r, c, agentSocket)
+				return
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if r.URL.Path == "/file" && r.Method == "GET" {
@@ -300,7 +332,7 @@ func serveManagedBridge(ctx context.Context, c Config, ready chan<- struct{}, st
 			stop()
 			return
 		}
-		if r.URL.Path == "/run" && r.Method == "POST" || r.URL.Path == "/file" && r.Method == "GET" {
+		if r.URL.Path == "/run" && r.Method == "POST" || r.URL.Path == "/file" && r.Method == "GET" || r.URL.Path == "/local-context" || r.URL.Path == "/git-credential" || r.URL.Path == "/ssh-agent" || r.URL.Path == "/git-ssh" {
 			activity.Lock()
 			if draining {
 				activity.Unlock()
@@ -450,9 +482,7 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 }
 
 func configHash(c Config) string {
-	b, _ := json.Marshal(c)
-	h := sha256.Sum256(b)
-	return fmt.Sprintf("%x", h)
+	return contextConfigHash(c, terminalEnvironment(), localAgentSocket())
 }
 
 // A dynamically discovered checkout has one lock shared by runs and artifacts.

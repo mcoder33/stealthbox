@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -117,8 +118,9 @@ func run(ctx context.Context, args []string) error {
 	shellIntegration := f.Bool("shell-integration", false, "wrap codex/claude only in the managed workspace shell")
 	plan := f.String("plan", "", "reviewed source sync plan file")
 	expectedHash := f.String("expected-hash", "", "expected destination fingerprint (internal source prepare)")
-	sourceExcludes := f.String("source-excludes", "", "JSON exclusion paths (internal source fingerprint/prepare)")
-	sourceSafeLinks := f.Bool("source-safe-links", false, "preserve safe relative symlinks (internal source fingerprint/prepare)")
+	sourceExcludes := f.String("source-excludes", "", "JSON exclusion paths (internal source ignore/fingerprint/prepare)")
+	sourceSafeLinks := f.Bool("source-safe-links", false, "preserve safe relative symlinks (internal source ignore/fingerprint/prepare)")
+	ignoreRulesStdin := f.Bool("source-ignore-rules-stdin", false, "read shared .gitignore rules from stdin (internal source fingerprint/prepare)")
 	macPath := f.String("mac-path", "", "dedicated disposable Mac runner path")
 	remove := f.Bool("delete", false, "remove project from config; keep files")
 	enableMac := f.Bool("enable-mac", false, "enable Mac runner bridge")
@@ -131,12 +133,16 @@ func run(ctx context.Context, args []string) error {
 	artifact := f.String("file", "", "artifact path relative to Mac runner")
 	output := f.String("output", "", "local output file (must not exist)")
 	edit := f.Bool("edit", false, "edit config with EDITOR")
+	localContext := f.Bool("local-context", true, "use local terminal environment and Git credentials on the VM")
 	if err = f.Parse(parseArgs); err != nil {
 		return err
 	}
 	visited := map[string]bool{}
 	f.Visit(func(value *flag.Flag) { visited[value.Name] = true })
 	applyWorkspaceFlags := func(c *stealthbox.Config) error {
+		if visited["local-context"] {
+			c.Bridge.LocalContext = localContext
+		}
 		oldHost, oldRoot := c.Workspace.Host, c.Workspace.VMRoot
 		if visited["host"] {
 			c.Workspace.Host = *host
@@ -229,7 +235,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		changed := false
-		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration", "runner"} {
+		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration", "runner", "local-context"} {
 			changed = changed || visited[name]
 		}
 		if changed {
@@ -373,10 +379,36 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.ServeMCP(ctx, c, os.Stdin, os.Stdout)
+	case "context-exec":
+		if *dry {
+			return nil
+		}
+		return stealthbox.RunWithLocalContext(ctx, c, *config, f.Args(), os.Stdin, os.Stdout, os.Stderr)
+	case "bridge-prepare-socket":
+		if *dry {
+			return nil
+		}
+		return stealthbox.PrepareBridgeSocket(ctx, c)
+	case "git-ssh":
+		if *dry {
+			fmt.Println("Would open Git SSH transport through the Mac bridge")
+			return nil
+		}
+		return stealthbox.GitSSH(ctx, c, f.Args(), os.Stdin, os.Stdout, os.Stderr)
+	case "credential-agent":
+		if *dry {
+			return nil
+		}
+		return stealthbox.ServeCredentialAgent(ctx, c, *config)
+	case "git-credential":
+		if *dry || len(f.Args()) != 1 {
+			return nil
+		}
+		return stealthbox.GitCredential(ctx, c, f.Args()[0], os.Stdin, os.Stdout)
 	case "source":
 		if visited["source-excludes"] || visited["source-safe-links"] {
-			if sourceAction != "fingerprint" && sourceAction != "prepare" {
-				return fmt.Errorf("--source-excludes and --source-safe-links are only for internal source fingerprint/prepare")
+			if sourceAction != "fingerprint" && sourceAction != "prepare" && sourceAction != "ignore" && sourceAction != "git-bootstrap" {
+				return fmt.Errorf("--source-excludes and --source-safe-links are only for internal source ignore/fingerprint/prepare")
 			}
 			if visited["source-excludes"] {
 				if err = json.Unmarshal([]byte(*sourceExcludes), &c.Workspace.SourceExcludes); err != nil {
@@ -390,7 +422,30 @@ func run(ctx context.Context, args []string) error {
 				return err
 			}
 		}
+		var rules []stealthbox.SourceIgnoreRules
+		if *ignoreRulesStdin {
+			if sourceAction != "fingerprint" && sourceAction != "prepare" {
+				return fmt.Errorf("--source-ignore-rules-stdin is only for internal source fingerprint/prepare")
+			}
+			data, err := io.ReadAll(io.LimitReader(os.Stdin, (1<<20)+1))
+			if err != nil {
+				return err
+			}
+			if len(data) > 1<<20 {
+				return fmt.Errorf("source .gitignore rules exceed 1 MiB")
+			}
+			var shared stealthbox.SourceIgnoreRules
+			if err = json.Unmarshal(data, &shared); err != nil {
+				return fmt.Errorf("invalid source .gitignore rules: %w", err)
+			}
+			rules = append(rules, shared)
+		}
 		switch sourceAction {
+		case "git-bootstrap":
+			if *dry {
+				return fmt.Errorf("--dry-run cannot bootstrap Git metadata")
+			}
+			return stealthbox.BootstrapSourceGit(ctx, c, *sourcePath, os.Stdin)
 		case "import", "export":
 			if *dry {
 				fmt.Printf("Would preview %s %s without changing source files; plan=%s delete=%t\n", sourceAction, *sourcePath, *plan, *remove)
@@ -404,7 +459,7 @@ func run(ctx context.Context, args []string) error {
 			}
 			return stealthbox.ApplySourceSync(ctx, c, *plan, os.Stdout)
 		case "fingerprint":
-			state, e := stealthbox.SourceFingerprint(ctx, c, *sourcePath)
+			state, e := stealthbox.SourceFingerprint(ctx, c, *sourcePath, rules...)
 			if e != nil {
 				return e
 			}
@@ -413,7 +468,13 @@ func run(ctx context.Context, args []string) error {
 			if *dry {
 				return fmt.Errorf("--dry-run cannot prepare a source destination")
 			}
-			return stealthbox.PrepareSourceDestination(ctx, c, *sourcePath, *expectedHash)
+			return stealthbox.PrepareSourceDestination(ctx, c, *sourcePath, *expectedHash, rules...)
+		case "ignore":
+			files, err := stealthbox.SourceIgnoreFiles(ctx, c, *sourcePath)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(files)
 		default:
 			return fmt.Errorf("source action must be import, export or apply")
 		}

@@ -12,8 +12,11 @@ import (
 	"time"
 )
 
-func ExecuteContext(ctx context.Context, c Command, stdin io.Reader, stdout, stderr io.Writer) error {
+func ExecuteContext(ctx context.Context, c Command, stdin io.Reader, stdout, stderr io.Writer, environment ...[]string) error {
 	cmd := exec.CommandContext(ctx, c.Program, c.Args...)
+	if len(environment) > 0 {
+		cmd.Env = environment[0]
+	}
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -22,8 +25,11 @@ func ExecuteContext(ctx context.Context, c Command, stdin io.Reader, stdout, std
 
 // ExecuteNoninteractiveContext owns the local command's process group. This
 // does not guarantee cancellation of a command behind an SSH connection.
-func ExecuteNoninteractiveContext(ctx context.Context, c Command, stdin io.Reader, stdout, stderr io.Writer) error {
+func ExecuteNoninteractiveContext(ctx context.Context, c Command, stdin io.Reader, stdout, stderr io.Writer, environment ...[]string) error {
 	cmd := exec.CommandContext(ctx, c.Program, c.Args...)
+	if len(environment) > 0 {
+		cmd.Env = environment[0]
+	}
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -104,6 +110,17 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 			if _, err := io.WriteString(stderr, executionReceipt(resolved, runner, commandDirectory, syncStatus, syncTransport)); err != nil {
 				return err
 			}
+		}
+		if runner == "vm" && dst.Host == "" && localContextLaunch(c) {
+			configPath := os.Getenv("STEALTHBOX_CONFIG")
+			if configPath == "" {
+				configPath = filepath.Join(c.Workspace.RemoteDir, "config.json")
+			}
+			environment, err := contextEnvironment(ctx, c, configPath)
+			if err != nil {
+				return err
+			}
+			return ExecuteNoninteractiveContext(ctx, At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false), nil, stdout, stderr, environment)
 		}
 		return ExecuteNoninteractiveContext(ctx, At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false), nil, stdout, stderr)
 	}

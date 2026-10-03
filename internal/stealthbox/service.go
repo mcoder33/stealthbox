@@ -196,6 +196,17 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 				continue
 			}
 		}
+		prepare, finish := context.WithTimeout(ctx, 10*time.Second)
+		err = ExecuteNoninteractiveContext(prepare, sshCommand(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-prepare-socket", "--config", remoteCfg}), false), nil, io.Discard, log)
+		finish()
+		if err != nil {
+			fmt.Fprintln(log, "Reverse bridge socket was not changed; inspect its owner before retrying.")
+			if err = pause(ctx, delay, log); err != nil {
+				return nil
+			}
+			delay = backoff(delay)
+			continue
+		}
 		cmd := sshCommand(c.Workspace.Host, "", false)
 		cmd.Args = cmd.Args[:len(cmd.Args)-1]
 		cmd.Args = append([]string{"-N", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
@@ -214,18 +225,24 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 func WaitRemoteBridge(ctx context.Context, c Config) error {
 	bin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
 	cfg := filepath.Join(c.Workspace.RemoteDir, "config.json")
-	for i := 0; i < 60; i++ {
-		probe, done := context.WithTimeout(ctx, 2*time.Second)
-		_, e := Output(probe, sshCommand(c.Workspace.Host, shellArgs([]string{bin, "bridge-health", "--config", cfg}), false))
+	waitCtx, stop := context.WithTimeout(ctx, 2*time.Minute)
+	defer stop()
+	var lastErr error
+	for i := 0; i < 60 && waitCtx.Err() == nil; i++ {
+		// Include a fresh SSH handshake, not just the socket health request.
+		probe, done := context.WithTimeout(waitCtx, 10*time.Second)
+		_, lastErr = Output(probe, sshCommand(c.Workspace.Host, shellArgs([]string{bin, "bridge-health", "--config", cfg}), false))
 		done()
-		if e == nil {
+		if lastErr == nil {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-waitCtx.Done():
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("reverse SSH bridge did not become ready; see %s.log", c.Bridge.Socket)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("reverse SSH bridge did not become ready: %w; see %s.log", lastErr, c.Bridge.Socket)
 }
