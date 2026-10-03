@@ -60,6 +60,7 @@ func Doctor(ctx context.Context, c Config, w io.Writer) error {
 		check(name, fn)
 	}
 	if WorkspaceRootEnabled(c) {
+		check("local Git (.gitignore source filters)", func(context.Context) error { _, e := exec.LookPath("git"); return e })
 		remoteCheck("workspace Projects root", c.Workspace.Host, func(ctx context.Context) error {
 			if !filepath.IsAbs(c.Workspace.VMRoot) {
 				return fmt.Errorf("run setup to expand VM ~")

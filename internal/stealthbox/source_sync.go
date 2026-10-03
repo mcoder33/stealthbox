@@ -1,6 +1,7 @@
 package stealthbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,28 +25,32 @@ type SourceEntry struct {
 	Target string `json:"target,omitempty"`
 }
 type SourceState struct {
-	Hash    string        `json:"hash"`
-	Exists  bool          `json:"exists"`
-	Entries []SourceEntry `json:"entries,omitempty"`
+	Hash         string            `json:"hash"`
+	Exists       bool              `json:"exists"`
+	Entries      []SourceEntry     `json:"entries,omitempty"`
+	IgnoredPaths []string          `json:"ignored_paths,omitempty"`
+	IgnoreRules  SourceIgnoreRules `json:"-"`
 }
 type SourceChange struct {
 	Action string `json:"action"`
 	Path   string `json:"path"`
 }
 type SourceSyncPlan struct {
-	Version         int            `json:"version"`
-	WorkspaceID     string         `json:"workspace_id"`
-	Host            string         `json:"host"`
-	VMRoot          string         `json:"vm_root"`
-	LocalRoot       string         `json:"local_root"`
-	RelativePath    string         `json:"relative_path"`
-	Direction       string         `json:"direction"`
-	Delete          bool           `json:"delete"`
-	SourceHash      string         `json:"source_hash"`
-	DestinationHash string         `json:"destination_hash"`
-	Changes         []SourceChange `json:"changes"`
-	SourceExcludes  []string       `json:"source_excludes,omitempty"`
-	SourceSafeLinks bool           `json:"source_safe_links,omitempty"`
+	Version              int            `json:"version"`
+	WorkspaceID          string         `json:"workspace_id"`
+	Host                 string         `json:"host"`
+	VMRoot               string         `json:"vm_root"`
+	LocalRoot            string         `json:"local_root"`
+	RelativePath         string         `json:"relative_path"`
+	Direction            string         `json:"direction"`
+	Delete               bool           `json:"delete"`
+	SourceHash           string         `json:"source_hash"`
+	DestinationHash      string         `json:"destination_hash"`
+	Changes              []SourceChange `json:"changes"`
+	SourceExcludes       []string       `json:"source_excludes,omitempty"`
+	SourceSafeLinks      bool           `json:"source_safe_links,omitempty"`
+	SourceGitIgnore      bool           `json:"source_gitignore,omitempty"`
+	GitIgnoreIncludeFile string         `json:"-"`
 }
 
 func sourceRelativePath(path string) (string, error) {
@@ -104,16 +109,39 @@ func sourceStateAt(ctx context.Context, root, relative string, sourceExcludes ..
 	return sourceStateAtWithOptions(ctx, root, relative, sourceExcludes, false)
 }
 
-func sourceStateAtWithOptions(ctx context.Context, root, relative string, sourceExcludes []string, safeLinks bool) (SourceState, error) {
+func sourceStateAtWithOptions(ctx context.Context, root, relative string, sourceExcludes []string, safeLinks bool, overrides ...SourceIgnoreRules) (SourceState, error) {
 	excludes, err := checkoutSourceExcludes(filepath.Clean(relative), sourceExcludes)
 	if err != nil {
 		return SourceState{}, err
+	}
+	var rules SourceIgnoreRules
+	if len(overrides) > 0 {
+		rules = overrides[0]
+	} else {
+		files, err := sourceIgnoreFiles(ctx, root, relative, sourceExcludes)
+		if err != nil {
+			return SourceState{}, err
+		}
+		rules = SourceIgnoreRules{files}
+	}
+	matchers, err := newSourceIgnoreMatchers(ctx, rules)
+	if err != nil {
+		return SourceState{}, err
+	}
+	defer matchers.Close()
+	ignoredPath := func(path string, isDir bool) (bool, error) {
+		return matchers.Ignored(filepath.Join(relative, path), isDir)
+	}
+	if ignored, err := matchers.Ignored(relative, true); err != nil {
+		return SourceState{}, err
+	} else if ignored {
+		return SourceState{}, fmt.Errorf("selected source checkout is ignored by .gitignore")
 	}
 	path, err := checkedSourcePath(root, relative)
 	if err != nil {
 		return SourceState{}, err
 	}
-	state := SourceState{Entries: []SourceEntry{}}
+	state := SourceState{Entries: []SourceEntry{}, IgnoreRules: rules}
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		state.Hash = "missing"
@@ -144,6 +172,17 @@ func sourceStateAtWithOptions(ctx context.Context, root, relative string, source
 			}
 			return nil
 		}
+		ignored, err := ignoredPath(rel, entry.IsDir())
+		if err != nil {
+			return err
+		}
+		if ignored {
+			state.IgnoredPaths = append(state.IgnoredPaths, filepath.ToSlash(rel))
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if strings.ContainsAny(rel, "\x00\n\r") {
 			return fmt.Errorf("unsupported source filename")
 		}
@@ -165,7 +204,7 @@ func sourceStateAtWithOptions(ctx context.Context, root, relative string, source
 			if err != nil {
 				return err
 			}
-			if err = validateSourceLink(ctx, path, file, item.Target, excludes); err != nil {
+			if err = validateSourceLink(ctx, path, file, item.Target, excludes, ignoredPath); err != nil {
 				return fmt.Errorf("unsafe source symlink %s: %w", rel, err)
 			}
 		case info.IsDir():
@@ -195,7 +234,10 @@ func sourceStateAtWithOptions(ctx context.Context, root, relative string, source
 	if err != nil {
 		return state, err
 	}
-	b, _ := json.Marshal(state.Entries)
+	b, _ := json.Marshal(struct {
+		Entries []SourceEntry
+		Rules   SourceIgnoreRules
+	}{state.Entries, rules})
 	sum := sha256.Sum256(b)
 	state.Hash = hex.EncodeToString(sum[:])
 	return state, nil
@@ -212,7 +254,7 @@ func sourceEntryMode(mode fs.FileMode) uint32 {
 
 // Resolve components without traversing a symlink before checking its target.
 // This also checks intermediate aliases, not just the final EvalSymlinks result.
-func validateSourceLink(ctx context.Context, root, file, target string, excludes []string) error {
+func validateSourceLink(ctx context.Context, root, file, target string, excludes []string, ignore ...func(string, bool) (bool, error)) error {
 	checkTarget := func(parent, target string) error {
 		if filepath.IsAbs(target) || target == "" || strings.ContainsAny(target, "\x00\n\r") {
 			return fmt.Errorf("link target must be a relative path")
@@ -269,6 +311,15 @@ func validateSourceLink(ctx context.Context, root, file, target string, excludes
 		if err != nil {
 			return fmt.Errorf("link target cannot be resolved: %w", err)
 		}
+		if len(ignore) > 0 {
+			ignored, err := ignore[0](relative, info.IsDir())
+			if err != nil {
+				return err
+			}
+			if ignored {
+				return fmt.Errorf("link target is excluded by .gitignore")
+			}
+		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			links++
 			if links > 255 {
@@ -293,15 +344,15 @@ func validateSourceLink(ctx context.Context, root, file, target string, excludes
 }
 
 // SourceFingerprint is used by the deployed VM binary; no shell embeds source contents.
-func SourceFingerprint(ctx context.Context, c Config, path string) (SourceState, error) {
+func SourceFingerprint(ctx context.Context, c Config, path string, rules ...SourceIgnoreRules) (SourceState, error) {
 	if c.Workspace.Host != "" {
 		return SourceState{}, fmt.Errorf("source fingerprint runs on the VM")
 	}
-	return sourceStateAtWithOptions(ctx, c.Workspace.VMRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks)
+	return sourceStateAtWithOptions(ctx, c.Workspace.VMRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks, rules...)
 }
 
-func PrepareSourceDestination(ctx context.Context, c Config, path, expected string) error {
-	state, err := SourceFingerprint(ctx, c, path)
+func PrepareSourceDestination(ctx context.Context, c Config, path, expected string, rules ...SourceIgnoreRules) error {
+	state, err := SourceFingerprint(ctx, c, path, rules...)
 	if err != nil {
 		return err
 	}
@@ -315,17 +366,28 @@ func PrepareSourceDestination(ctx context.Context, c Config, path, expected stri
 	return os.MkdirAll(destination, 0700)
 }
 
-func remoteSourceState(ctx context.Context, c Config, path string) (SourceState, error) {
+func remoteSourceState(ctx context.Context, c Config, path string, rules ...SourceIgnoreRules) (SourceState, error) {
 	if c.Workspace.Host == "" {
-		return sourceStateAtWithOptions(ctx, c.Workspace.VMRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks)
+		return sourceStateAtWithOptions(ctx, c.Workspace.VMRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks, rules...)
 	}
 	if c.Workspace.RemoteDir == "" {
 		return SourceState{}, fmt.Errorf("run setup before source sync")
 	}
 	args := remoteSourceArgs(c, "fingerprint", path)
-	b, err := Output(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false))
+	var input io.Reader
+	if len(rules) > 0 {
+		args = append(args, "--source-ignore-rules-stdin")
+		data, err := json.Marshal(rules[0])
+		if err != nil || len(data) > sourceIgnoreLimit {
+			return SourceState{}, fmt.Errorf("source .gitignore rules exceed 1 MiB")
+		}
+		input = bytes.NewReader(data)
+	}
+	var output, details bytes.Buffer
+	err := ExecuteNoninteractiveContext(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false), input, &output, &details)
+	b := output.Bytes()
 	if err != nil {
-		return SourceState{}, fmt.Errorf("remote source fingerprint: %w", err)
+		return SourceState{}, fmt.Errorf("remote source fingerprint: %w: %s", err, details.String())
 	}
 	if len(b) > 32<<20 {
 		return SourceState{}, fmt.Errorf("remote source manifest exceeds limit")
@@ -333,6 +395,9 @@ func remoteSourceState(ctx context.Context, c Config, path string) (SourceState,
 	var state SourceState
 	if err = json.Unmarshal(b, &state); err != nil {
 		return state, fmt.Errorf("invalid remote source manifest: %w", err)
+	}
+	if len(rules) > 0 {
+		state.IgnoreRules = rules[0]
 	}
 	return state, nil
 }
@@ -344,13 +409,41 @@ func remoteSourceArgs(c Config, action, path string) []string {
 }
 
 func sourceSyncStates(ctx context.Context, c Config, path, direction string) (SourceState, SourceState, error) {
-	local, err := sourceStateAtWithOptions(ctx, c.Workspace.LocalRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks)
+	localFiles, err := sourceIgnoreFiles(ctx, c.Workspace.LocalRoot, path, c.Workspace.SourceExcludes)
 	if err != nil {
 		return SourceState{}, SourceState{}, err
 	}
-	remote, err := remoteSourceState(ctx, c, path)
+	remoteFiles, err := remoteSourceIgnoreFiles(ctx, c, path)
 	if err != nil {
 		return SourceState{}, SourceState{}, err
+	}
+	rules := SourceIgnoreRules{localFiles, remoteFiles}
+	local, err := sourceStateAtWithOptions(ctx, c.Workspace.LocalRoot, path, c.Workspace.SourceExcludes, c.Workspace.SourceSafeLinks, rules)
+	if err != nil {
+		return SourceState{}, SourceState{}, err
+	}
+	remote, err := remoteSourceState(ctx, c, path, rules)
+	if err != nil {
+		return SourceState{}, SourceState{}, err
+	}
+	// A directory-only ignore may allow a regular file at the same path on
+	// the other side. Reject that collision before rsync can replace the
+	// receiver's protected directory with the sender's file.
+	for _, pair := range [][2]SourceState{{local, remote}, {remote, local}} {
+		ignored := make(map[string]bool, len(pair[0].IgnoredPaths))
+		for _, path := range pair[0].IgnoredPaths {
+			ignored[path] = true
+		}
+		for _, entry := range pair[1].Entries {
+			if entry.Path != "." && (!filepath.IsLocal(entry.Path) || filepath.ToSlash(filepath.Clean(entry.Path)) != entry.Path || strings.ContainsAny(entry.Path, "\x00\n\r")) {
+				return SourceState{}, SourceState{}, fmt.Errorf("invalid source manifest path %q", entry.Path)
+			}
+			for path := entry.Path; path != "."; path = filepath.ToSlash(filepath.Dir(path)) {
+				if ignored[path] {
+					return SourceState{}, SourceState{}, fmt.Errorf("source path %s conflicts with an ignored path on the other side; reconcile the path types or .gitignore rules first", entry.Path)
+				}
+			}
+		}
 	}
 	if direction == "import" {
 		return local, remote, nil
@@ -443,6 +536,7 @@ func PreviewSourceSync(ctx context.Context, c Config, direction, path string, re
 	plan := SourceSyncPlan{Version: 1, WorkspaceID: c.Workspace.ID, Host: c.Workspace.Host, VMRoot: c.Workspace.VMRoot, LocalRoot: c.Workspace.LocalRoot, RelativePath: path, Direction: direction, Delete: remove, SourceHash: source.Hash, DestinationHash: destination.Hash, Changes: sourceChanges(source, destination, remove)}
 	plan.SourceExcludes, _ = canonicalSourceExcludes(c.Workspace.SourceExcludes)
 	plan.SourceSafeLinks = c.Workspace.SourceSafeLinks
+	plan.SourceGitIgnore = true
 	b, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		return err
@@ -525,6 +619,14 @@ func sourceSyncCommand(c Config, plan SourceSyncPlan) (Command, error) {
 		// Anchored literal filters match a file or directory and protect it from --delete.
 		args = append(args, "--exclude=/"+exclude)
 	}
+	if plan.SourceGitIgnore {
+		// Only the current manifests may participate in this transfer. This also
+		// protects newly created ignored files between fingerprinting and rsync.
+		if plan.GitIgnoreIncludeFile == "" {
+			return Command{}, fmt.Errorf("source .gitignore transfer requires current manifests")
+		}
+		args = append(args, "--include-from="+plan.GitIgnoreIncludeFile, "--exclude=*")
+	}
 	for _, arg := range command.Args {
 		if arg == "--no-links" && c.Workspace.SourceSafeLinks {
 			args = append(args, "--links")
@@ -566,6 +668,9 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	}
 	if plan.Version != 1 || plan.WorkspaceID != c.Workspace.ID || plan.Host != c.Workspace.Host || plan.VMRoot != c.Workspace.VMRoot || plan.LocalRoot != c.Workspace.LocalRoot {
 		return fmt.Errorf("source plan belongs to a different workspace configuration")
+	}
+	if !plan.SourceGitIgnore {
+		return fmt.Errorf("source .gitignore policy changed; generate a new plan")
 	}
 	currentExcludes, _ := canonicalSourceExcludes(c.Workspace.SourceExcludes)
 	planExcludes, err := canonicalSourceExcludes(plan.SourceExcludes)
@@ -611,6 +716,11 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	if JSONString(sourceChanges(source, destination, plan.Delete)) != JSONString(plan.Changes) {
 		return fmt.Errorf("source plan change list does not match its fingerprints")
 	}
+	plan.GitIgnoreIncludeFile, err = sourceIgnoreIncludeFile(source, destination)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(plan.GitIgnoreIncludeFile)
 	command, err := sourceSyncCommand(c, plan)
 	if err != nil {
 		return err
@@ -633,7 +743,8 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 		}
 	} else {
 		args := append(remoteSourceArgs(c, "prepare", path), "--expected-hash", destination.Hash)
-		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false), nil, io.Discard, w); err != nil {
+		args = append(args, "--source-ignore-rules-stdin")
+		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, shellArgs(args), false), strings.NewReader(JSONString(source.IgnoreRules)), io.Discard, w); err != nil {
 			return err
 		}
 	}

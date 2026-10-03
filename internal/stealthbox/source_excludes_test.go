@@ -41,7 +41,10 @@ func TestSourceSymlinkModeCanonicalAcrossPlatforms(t *testing.T) {
 		if !found {
 			t.Fatal("live fingerprint omitted the symlink")
 		}
-		serialized, err := json.Marshal(platformState.Entries)
+		serialized, err := json.Marshal(struct {
+			Entries []SourceEntry
+			Rules   SourceIgnoreRules
+		}{platformState.Entries, actual.IgnoreRules})
 		if err != nil {
 			t.Fatal(err)
 		}
