@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ResolvedProject identifies a checkout, never just its basename. Git worktrees
@@ -97,7 +98,13 @@ func ResolveProject(ctx context.Context, c Config, selector, cwd string) (Resolv
 		return ResolvedProject{}, err
 	}
 	if p, ok := c.Projects[selector]; ok {
-		return ResolvedProject{ID: selector, DisplayName: selector, SourcePath: p.Source.Path, RelativeCWD: relativeCWD, RunnerPath: p.Runners["mac"].Path, StaticName: selector, Project: p}, nil
+		sourcePath := p.Source.Path
+		if p.Source.Host == "" {
+			if physical, err := filepath.EvalSymlinks(sourcePath); err == nil {
+				sourcePath = physical
+			}
+		}
+		return ResolvedProject{ID: selector, DisplayName: selector, SourcePath: sourcePath, RelativeCWD: relativeCWD, RunnerPath: p.Runners["mac"].Path, StaticName: selector, Project: p}, nil
 	}
 	if !WorkspaceRootEnabled(c) {
 		return ResolvedProject{}, fmt.Errorf("unknown project %q", selector)
@@ -229,12 +236,14 @@ func resolveRemoteCheckout(ctx context.Context, host, root, selected string) (ca
 // WorkspaceProjects lists Git checkouts and worktrees without following directory
 // symlinks. The list is discovery only; every execution resolves containment again.
 func WorkspaceProjects(ctx context.Context, c Config) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	if !WorkspaceRootEnabled(c) {
 		return Names(c), nil
 	}
 	if c.Workspace.Host != "" {
 		script := "cd -P " + Quote(c.Workspace.VMRoot) + " && find . \\( -name '.env*' -o -name vendor -o -name node_modules -o -name .claude -o -name .codex -o -name .agents -o -name .opencode -o -name .kimi-code -o -name .serena \\) -prune -o -name .git -prune -print"
-		data, err := Output(ctx, At(Endpoint{Host: c.Workspace.Host}, script, false))
+		data, err := noninteractiveOutput(ctx, At(Endpoint{Host: c.Workspace.Host}, script, false))
 		if err != nil {
 			return nil, err
 		}
@@ -331,15 +340,12 @@ func WorkspaceCheckoutPath(c Config, path string) (string, error) {
 }
 
 func executionDirectory(ctx context.Context, endpoint Endpoint, cwd string) (string, error) {
-	if cwd == "" {
-		return endpoint.Path, nil
-	}
 	if _, err := relativeCommandDirectory(cwd); err != nil {
 		return "", err
 	}
 	if endpoint.Host != "" {
 		script := "set -eu; cd -P " + Quote(endpoint.Path) + "; root=$(pwd -P); cd -P " + Quote(filepath.Join(endpoint.Path, cwd)) + "; current=$(pwd -P); case \"$current\" in \"$root\"|\"$root\"/*) ;; *) exit 41;; esac; printf '%s\\n' \"$current\""
-		data, err := Output(ctx, At(endpoint, script, false))
+		data, err := noninteractiveOutput(ctx, At(endpoint, script, false))
 		if err != nil {
 			return "", fmt.Errorf("command cwd is unavailable or outside its checkout: %w", err)
 		}

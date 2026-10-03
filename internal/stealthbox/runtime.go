@@ -1,6 +1,7 @@
 package stealthbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -43,6 +44,29 @@ func ExecuteNoninteractiveContext(ctx context.Context, c Command, stdin io.Reade
 	}
 	return err
 }
+
+func noninteractiveOutput(ctx context.Context, command Command) ([]byte, error) {
+	var stdout, stderr bytes.Buffer
+	err := ExecuteNoninteractiveContext(ctx, command, nil, &stdout, &stderr)
+	if err != nil && stderr.Len() > 0 {
+		err = fmt.Errorf("%s: %w: %s", command.Program, err, stderr.Bytes())
+	}
+	return stdout.Bytes(), err
+}
+
+func executionReceipt(resolved ResolvedProject, runner, cwd, syncStatus, transport string) string {
+	receipt := struct {
+		Checkout      string `json:"checkout"`
+		CheckoutHost  string `json:"checkout_host,omitempty"`
+		Runner        string `json:"runner"`
+		RunnerHost    string `json:"runner_host,omitempty"`
+		CWD           string `json:"cwd"`
+		Sync          string `json:"sync"`
+		SyncTransport string `json:"sync_transport,omitempty"`
+	}{Checkout: resolved.SourcePath, CheckoutHost: resolved.Project.Source.Host, Runner: runner, RunnerHost: resolved.Project.Runners[runner].Host, CWD: cwd, Sync: syncStatus, SyncTransport: transport}
+	return "[execution] " + JSONString(receipt) + "\n"
+}
+
 func Run(ctx context.Context, c Config, name, runner string, args []string, snapshot bool, cwd string, stdout, stderr io.Writer) error {
 	resolved, err := ResolveProject(ctx, c, name, cwd)
 	if err != nil {
@@ -67,10 +91,19 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 	if resolved.StaticName == "" {
 		commandArgs = "env COMPOSE_PROJECT_NAME=" + Quote(resolved.ID) + " " + commandArgs
 	}
+	syncStatus, syncTransport := "not-requested", ""
+	if snapshot {
+		syncStatus = "not-needed"
+	}
 	execute := func() error {
 		commandDirectory, err := executionDirectory(ctx, dst, resolved.RelativeCWD)
 		if err != nil {
 			return err
+		}
+		if stderr != nil {
+			if _, err := io.WriteString(stderr, executionReceipt(resolved, runner, commandDirectory, syncStatus, syncTransport)); err != nil {
+				return err
+			}
 		}
 		return ExecuteNoninteractiveContext(ctx, At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false), nil, stdout, stderr)
 	}
@@ -86,6 +119,7 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 			return err
 		}
 	}
+	syncStatus, syncTransport = "completed", "rsync"
 	return execute()
 
 }

@@ -96,6 +96,7 @@ func run(ctx context.Context, args []string) error {
 	}
 	config := f.String("config", def, "configuration path")
 	project := f.String("project", os.Getenv("STEALTHBOX_PROJECT"), "project name")
+	discover := f.Bool("discover", false, "discover checkout paths under the workspace root (list)")
 	runnerDefault := os.Getenv("STEALTHBOX_RUNNER")
 	if os.Getenv("STEALTHBOX_RUNNER_SOURCE") == "default" {
 		runnerDefault = ""
@@ -252,6 +253,18 @@ func run(ctx context.Context, args []string) error {
 			a, r := stealthbox.Defaults(p, "", "")
 			fmt.Printf("%s\t%s\t%s\t%s\n", n, a, r, p.Source.Path)
 		}
+		if *discover {
+			if !stealthbox.WorkspaceRootEnabled(c) {
+				return fmt.Errorf("--discover requires a workspace VMRoot; list named profiles without this flag")
+			}
+			paths, err := stealthbox.WorkspaceProjects(ctx, c)
+			if err != nil {
+				return err
+			}
+			for _, path := range paths {
+				fmt.Printf("checkout\t%s\n", path)
+			}
+		}
 		return nil
 	case "project":
 		if *project == "" {
@@ -352,7 +365,7 @@ func run(ctx context.Context, args []string) error {
 		if e != nil {
 			return e
 		}
-		fmt.Printf("Mac bridge: online; direct execution=%t\n", s.AllowExec)
+		fmt.Printf("Local Mac bridge daemon: healthy; direct execution=%t. VM connectivity was not checked.\n", s.AllowExec)
 		return nil
 	case "mcp":
 		if *dry {
@@ -553,7 +566,8 @@ func usage() {
   stealthbox bridge                  Foreground Mac runner + reverse SSH tunnel
   stealthbox bridge-start|bridge-stop|bridge-status  Manage background Mac bridge
   stealthbox config [--edit]          Show redacted config or edit with EDITOR
-  stealthbox list                     List projects
+  stealthbox list                     List workspace and optional named profiles
+  stealthbox list --discover          Discover checkout paths under Projects
   stealthbox source import|export --path REL --plan FILE [--delete]
                                      Preview local → VM / VM → local transfer; source files stay unchanged
   stealthbox source apply --plan FILE Apply reviewed plan only if both sides are unchanged

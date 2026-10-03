@@ -3,12 +3,14 @@ package stealthbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -25,13 +27,32 @@ func BridgeStatus(ctx context.Context, c Config) (BridgeState, error) {
 	req.Header.Set("Authorization", "Bearer "+c.Bridge.Token)
 	res, err := bridgeHTTP(c.Bridge.Socket).Do(req)
 	if err != nil {
-		return s, err
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return s, fmt.Errorf("local Mac bridge is not running; use bridge-start: %w", err)
+		case errors.Is(err, syscall.ECONNREFUSED):
+			return s, fmt.Errorf("local Mac bridge socket refused connection; the daemon may have stopped or the socket may be stale; inspect its owner before restarting: %w", err)
+		case errors.Is(err, os.ErrPermission):
+			return s, fmt.Errorf("local Mac bridge socket permission denied; check its owner and permissions: %w", err)
+		default:
+			return s, fmt.Errorf("local Mac bridge status could not be checked: %w", err)
+		}
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return s, fmt.Errorf("bridge status: HTTP %d", res.StatusCode)
+		if res.StatusCode == http.StatusUnauthorized {
+			return s, fmt.Errorf("local Mac bridge rejected credentials (HTTP 401); use the configuration matching the running daemon")
+		}
+		detail, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return s, fmt.Errorf("local Mac bridge status: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(detail)))
 	}
 	err = json.NewDecoder(res.Body).Decode(&s)
+	if err != nil {
+		return s, fmt.Errorf("local Mac bridge returned an invalid health response: %w", err)
+	}
+	if !s.OK {
+		return s, fmt.Errorf("local Mac bridge reports unhealthy")
+	}
 	return s, err
 }
 func StopBridgeService(ctx context.Context, c Config) error {

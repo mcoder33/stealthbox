@@ -177,7 +177,7 @@ func TUI(ctx context.Context, path string) error {
 		if c.Bridge.Enabled {
 			state = "on"
 		}
-		i, e := choose(ctx, "VM: "+c.Workspace.Host+" · Mac bridge: "+state, []string{"Continue in tmux / продолжить работу", "Projects / проекты", "VM and workspace / настройки ВМ", "Mac runner / доступ к Mac", "Agent environment / Codex и Claude", "Import current tmux style / оформление", "Prepare or update VM / подготовка среды", "Doctor / диагностика", "Source import/export / перенос исходников", "Exit"}, 0)
+		i, e := choose(ctx, "VM: "+c.Workspace.Host+" · Mac bridge: "+state, []string{"Continue in tmux / продолжить работу", "Named profiles (optional) / именованные профили", "VM and workspace / настройки ВМ", "Mac runner / доступ к Mac", "Agent environment / Codex и Claude", "Import current tmux style / оформление", "Prepare or update VM / подготовка среды", "Doctor / диагностика", "Source import/export / перенос исходников", "Exit"}, 0)
 		if e != nil {
 			return e
 		}
@@ -232,7 +232,7 @@ func TUI(ctx context.Context, path string) error {
 					var state BridgeState
 					state, err = BridgeStatus(ctx, c)
 					if err == nil {
-						fmt.Printf("Online; direct execution=%t\n", state.AllowExec)
+						fmt.Printf("Local Mac bridge daemon: healthy; direct execution=%t. VM connectivity was not checked.\n", state.AllowExec)
 					}
 				}
 				if err != nil {
@@ -357,8 +357,8 @@ func sourceSyncTUI(ctx context.Context, c Config, configPath string) error {
 func editProject(ctx context.Context, c *Config, path string) error {
 	next := cloneConfig(*c)
 	names := Names(next)
-	items := append([]string{"Add project"}, names...)
-	i, err := choose(ctx, "Projects", items, 0)
+	items := append([]string{"Add named profile"}, names...)
+	i, err := choose(ctx, "Optional named profiles; repositories under Projects need no registration", items, 0)
 	if err != nil || i < 0 {
 		return err
 	}

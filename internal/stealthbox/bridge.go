@@ -138,6 +138,7 @@ func BridgeHandler(c Config) http.Handler {
 		}
 		defer lock.Unlock()
 		max, _ := limits(c)
+		syncStatus, syncTransport := "not-requested", ""
 		if req.Sync {
 			transport := req.Transport
 			if transport == "" {
@@ -161,6 +162,7 @@ func BridgeHandler(c Config) http.Handler {
 				http.Error(w, err.Error(), 400)
 				return
 			}
+			syncStatus, syncTransport = "completed", transport
 		}
 
 		if !req.Sync {
@@ -204,6 +206,9 @@ func BridgeHandler(c Config) http.Handler {
 		}
 		cmd.Stdout = eventWriter{mu, enc, flusher, "stdout"}
 		cmd.Stderr = eventWriter{mu, enc, flusher, "stderr"}
+		if _, err := io.WriteString(cmd.Stderr, executionReceipt(resolved, "mac", cwd, syncStatus, syncTransport)); err != nil {
+			return
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.Cancel = func() error {
 			if cmd.Process == nil {

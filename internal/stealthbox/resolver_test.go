@@ -210,15 +210,15 @@ func TestVMExecutionRejectsCWDSymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, root+"/escape"); err != nil {
 		t.Fatal(err)
 	}
-	var out bytes.Buffer
-	if err := Run(context.Background(), c, "repo", "vm", []string{"pwd"}, false, "escape", &out, &out); err == nil {
+	var out, diagnostic bytes.Buffer
+	if err := Run(context.Background(), c, "repo", "vm", []string{"pwd"}, false, "escape", &out, &diagnostic); err == nil {
 		t.Fatal("VM cwd symlink accepted", out.String())
 	}
 	if err := os.Mkdir(root+"/tests", 0700); err != nil {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if err := Run(context.Background(), c, "repo", "vm", []string{"pwd"}, false, "tests", &out, &out); err != nil {
+	if err := Run(context.Background(), c, "repo", "vm", []string{"pwd"}, false, "tests", &out, &diagnostic); err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(out.String()) != root+"/tests" {
