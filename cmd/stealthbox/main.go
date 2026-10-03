@@ -384,6 +384,11 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.RunWithLocalContext(ctx, c, *config, f.Args(), os.Stdin, os.Stdout, os.Stderr)
+	case "bridge-prepare-socket":
+		if *dry {
+			return nil
+		}
+		return stealthbox.PrepareBridgeSocket(ctx, c)
 	case "git-ssh":
 		if *dry {
 			fmt.Println("Would open Git SSH transport through the Mac bridge")

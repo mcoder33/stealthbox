@@ -196,6 +196,17 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 				continue
 			}
 		}
+		prepare, finish := context.WithTimeout(ctx, 10*time.Second)
+		err = ExecuteNoninteractiveContext(prepare, sshCommand(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-prepare-socket", "--config", remoteCfg}), false), nil, io.Discard, log)
+		finish()
+		if err != nil {
+			fmt.Fprintln(log, "Reverse bridge socket was not changed; inspect its owner before retrying.")
+			if err = pause(ctx, delay, log); err != nil {
+				return nil
+			}
+			delay = backoff(delay)
+			continue
+		}
 		cmd := sshCommand(c.Workspace.Host, "", false)
 		cmd.Args = cmd.Args[:len(cmd.Args)-1]
 		cmd.Args = append([]string{"-N", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
