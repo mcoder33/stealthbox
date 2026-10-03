@@ -281,7 +281,7 @@ stealthbox tui              # прежнее имя той же команды
 |---|---|
 | **VM and workspace** | SSH, каталоги Projects, исполнитель по умолчанию |
 | **Continue in tmux** | Сразу вернуться в текущую сессию |
-| **Projects** | Дополнительные именованные проекты и их индивидуальные исполнители |
+| **Named profiles (optional)** | Необязательные именованные профили и их индивидуальные исполнители |
 | **Mac runner** | Мост, прямые команды, таймаут, запуск/остановка/статус |
 | **Agent environment** | Проверить доступность Codex и Claude |
 | **Import current tmux style** | Эффективные опции и клавиши работающего локального tmux |
@@ -584,6 +584,11 @@ python3 tests/integration/tui.py   # настоящий TUI через pseudo-te
 make e2e                          # временный Linux SSH/tmux + локальный Docker
 make release VERSION=v0.4.3        # шесть бинарников и checksums.txt
 ```
+
+**v0.4.3, свежая проверка кандидата:** Go race/vet, полный SSH/tmux/rsync/Docker E2E
+и TUI прошли. Четыре набора Zadolbator через локальный Linux SSH fixture и Mac runner:
+**1264 теста, 5557 assertions; 1262 passed, два incomplete, failures/errors — 0**.
+[Результаты, схема фактического прогона и границы проверки](docs/verification-v0.4.3.md).
 
 **v0.4.2:** отдельный прогон переноса исходников между Mac/Linux и изолированного
 QA-стека Zadolbator описан в [отчёте с результатами и границами проверки](docs/verification-v0.4.2-manual.md).
