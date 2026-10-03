@@ -96,7 +96,11 @@ func run(ctx context.Context, args []string) error {
 	}
 	config := f.String("config", def, "configuration path")
 	project := f.String("project", os.Getenv("STEALTHBOX_PROJECT"), "project name")
-	runner := f.String("runner", os.Getenv("STEALTHBOX_RUNNER"), "runner name")
+	runnerDefault := os.Getenv("STEALTHBOX_RUNNER")
+	if os.Getenv("STEALTHBOX_RUNNER_SOURCE") == "default" {
+		runnerDefault = ""
+	}
+	runner := f.String("runner", runnerDefault, "runner name")
 	agent := f.String("agent", "", "agent name")
 	session := f.String("session", "tmux", "tmux or shell")
 	slot := f.String("slot", "main", "distinct agent instance name")
@@ -426,6 +430,7 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("set --project or STEALTHBOX_PROJECT")
 		}
 	}
+	requestedRunner := *runner
 	p, configured := c.Projects[*project]
 	if configured {
 		*agent, *runner = stealthbox.Defaults(p, *agent, *runner)
@@ -453,19 +458,19 @@ func run(ctx context.Context, args []string) error {
 			fmt.Printf("Mac terminal → SSH %s → %s workspace; project=%s agent=%s runner=%s slot=%s; Mac bridge=%t\n", c.Workspace.Host, *session, *project, *agent, *runner, *slot, c.Bridge.Enabled)
 			return nil
 		}
-		return stealthbox.Connect(ctx, &c, *config, stealthbox.ConnectOptions{Project: *project, Agent: *agent, Runner: *runner, Slot: *slot, Binary: *binary, Extra: f.Args(), Reconnect: *reconnect, Session: *session, Resume: resume}, os.Stdout, os.Stderr)
+		return stealthbox.Connect(ctx, &c, *config, stealthbox.ConnectOptions{Project: *project, Agent: *agent, Runner: requestedRunner, Slot: *slot, Binary: *binary, Extra: f.Args(), Reconnect: *reconnect, Session: *session, Resume: resume}, os.Stdout, os.Stderr)
 	case "workspace":
 		if *dry {
 			fmt.Println(stealthbox.WindowName(*project, *agent, *runner, *slot, f.Args()))
 			return nil
 		}
 		if *session == "shell" {
-			return stealthbox.PlainRemote(ctx, c, *config, *project, *agent, *runner, f.Args(), os.Stdout, os.Stderr)
+			return stealthbox.PlainRemote(ctx, c, *config, *project, *agent, requestedRunner, f.Args(), os.Stdout, os.Stderr)
 		}
 		if *resumeWorkspace {
-			return stealthbox.ResumeWorkspaceRemote(ctx, c, *config, *project, *runner, !*noAttach, os.Stdout, os.Stderr)
+			return stealthbox.ResumeWorkspaceRemote(ctx, c, *config, *project, requestedRunner, !*noAttach, os.Stdout, os.Stderr)
 		}
-		return stealthbox.WorkspaceRemote(ctx, c, *config, *project, *agent, *runner, *slot, f.Args(), !*noAttach, os.Stdout, os.Stderr)
+		return stealthbox.WorkspaceRemote(ctx, c, *config, *project, *agent, requestedRunner, *slot, f.Args(), !*noAttach, os.Stdout, os.Stderr)
 	case "agent":
 		if positionalAgent != "" {
 			*agent = positionalAgent

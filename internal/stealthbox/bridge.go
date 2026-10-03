@@ -269,11 +269,24 @@ func serveManagedBridge(ctx context.Context, c Config, ready chan<- struct{}, st
 		return err
 	}
 	handler := BridgeHandler(c)
+	var activity sync.Mutex
+	activeRequests := 0
+	draining := false
 	managed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/shutdown" && r.Method == "POST" && stop != nil {
-			if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(c.Bridge.Token)) != 1 {
-				http.Error(w, "unauthorized", 401)
-				return
+		if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(c.Bridge.Token)) != 1 {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		if (r.URL.Path == "/shutdown" || r.URL.Path == "/shutdown-idle") && r.Method == "POST" && stop != nil {
+			if r.URL.Path == "/shutdown-idle" {
+				activity.Lock()
+				if activeRequests > 0 {
+					activity.Unlock()
+					http.Error(w, "bridge is busy", http.StatusConflict)
+					return
+				}
+				draining = true
+				activity.Unlock()
 			}
 			w.WriteHeader(200)
 			if f, ok := w.(http.Flusher); ok {
@@ -281,6 +294,21 @@ func serveManagedBridge(ctx context.Context, c Config, ready chan<- struct{}, st
 			}
 			stop()
 			return
+		}
+		if r.URL.Path == "/run" && r.Method == "POST" || r.URL.Path == "/file" && r.Method == "GET" {
+			activity.Lock()
+			if draining {
+				activity.Unlock()
+				http.Error(w, "bridge is refreshing; retry after reconnect", http.StatusServiceUnavailable)
+				return
+			}
+			activeRequests++
+			activity.Unlock()
+			defer func() {
+				activity.Lock()
+				activeRequests--
+				activity.Unlock()
+			}()
 		}
 		handler.ServeHTTP(w, r)
 	})

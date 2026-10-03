@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRootWorkspaceLaunchClearsStaticBinding(t *testing.T) {
@@ -74,7 +75,7 @@ func TestManagedWrapperCallsRealAgentOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "agent\ncodex\n--runner\nlocal\n--\nargument with spaces\n$literal\n"
+	expected := "agent\ncodex\n--\nargument with spaces\n$literal\n"
 	if string(actual) != expected {
 		t.Fatalf("wrapper argv or number of calls differs: %q", actual)
 	}
@@ -139,5 +140,49 @@ func TestManagedZshPreservesStartupPathAndOverridesAliases(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "kept") || !strings.Contains(string(b), "/user-custom-tools:") || !strings.Contains(string(b), "codex: function") {
 		t.Fatal(string(b))
+	}
+}
+
+func TestRunningAgentRetainsCapturedRunnerAfterDefaultChanges(t *testing.T) {
+	c := sourceTestConfig(t)
+	c.Bridge.Enabled = true
+	c.Workspace.Runner = "vm"
+	c.Workspace.RemoteDir = t.TempDir()
+	config := filepath.Join(c.Workspace.RemoteDir, "config.json")
+	ready, finish, result := filepath.Join(c.Workspace.RemoteDir, "ready"), filepath.Join(c.Workspace.RemoteDir, "finish"), filepath.Join(c.Workspace.RemoteDir, "result")
+	agent := filepath.Join(c.Workspace.RemoteDir, "codex-fixture")
+	program := "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$STEALTHBOX_RUNNER\" \"$STEALTHBOX_RUNNER_SOURCE\" \"$$\" > " + Quote(ready) + "\nwhile [ ! -f " + Quote(finish) + " ]; do sleep 0.02; done\nprintf '%s|%s|%s\\n' \"$STEALTHBOX_RUNNER\" \"$STEALTHBOX_RUNNER_SOURCE\" \"$$\" > " + Quote(result) + "\n"
+	if err := os.WriteFile(agent, []byte(program), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.Agents["codex"] = []string{agent}
+	if err := Save(config, c); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func(initialConfig Config) {
+		done <- LaunchAgent(ctx, initialConfig, config, initialConfig.Workspace.VMRoot, "codex", "", nil, &strings.Builder{}, &strings.Builder{})
+	}(c)
+	defer os.WriteFile(finish, nil, 0600)
+	waitForFixtureFile(t, ready)
+	before, err := os.ReadFile(ready)
+	if err != nil || !strings.HasPrefix(string(before), "vm|captured|") {
+		t.Fatal("agent did not capture initial runner", err)
+	}
+	c.Workspace.Runner = "mac"
+	if err := Save(config, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finish, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(result)
+	if err != nil || string(after) != string(before) {
+		t.Fatal("running agent changed runner or PID", err)
 	}
 }

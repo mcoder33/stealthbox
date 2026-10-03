@@ -191,7 +191,7 @@ func TUI(ctx context.Context, path string) error {
 				pauseTUI(ctx)
 				continue
 			}
-			err = Connect(ctx, &c, path, ConnectOptions{Agent: "shell", Runner: WorkspaceRunner(c), Reconnect: true, Session: "tmux", Resume: true}, os.Stdout, os.Stderr)
+			err = Connect(ctx, &c, path, ConnectOptions{Agent: "shell", Reconnect: true, Session: "tmux", Resume: true}, os.Stdout, os.Stderr)
 			if err != nil {
 				fmt.Println("Error:", err)
 			}

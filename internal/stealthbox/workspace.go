@@ -90,11 +90,12 @@ func workspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 		// Session-scoped defaults also reach ordinary new windows and split panes.
 		defaults := launch
 		defaults.agent, defaults.binding = "shell", ""
+		defaults.runner, defaults.runnerPinned = WorkspaceRunner(c), false
 		defaultScript, e := workspaceLaunchScript(c, configPath, defaults, nil)
 		if e != nil {
 			return e
 		}
-		for key, value := range map[string]string{"STEALTHBOX_CONFIG": configPath, "STEALTHBOX_SCOPE": "workspace", "STEALTHBOX_PROJECT": "", "STEALTHBOX_RUNNER": runner, "STEALTHBOX_VM_ROOT": c.Workspace.VMRoot, "PATH": managedPath()} {
+		for key, value := range map[string]string{"STEALTHBOX_CONFIG": configPath, "STEALTHBOX_SCOPE": "workspace", "STEALTHBOX_PROJECT": "", "STEALTHBOX_RUNNER": defaults.runner, "STEALTHBOX_RUNNER_SOURCE": "default", "STEALTHBOX_VM_ROOT": c.Workspace.VMRoot, "PATH": managedPath()} {
 			if _, e = invoke("set-environment", "-t", name, key, value); e != nil {
 				return e
 			}
@@ -115,7 +116,11 @@ func workspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 	if os.Getenv("TMUX") != "" {
 		return fmt.Errorf("already inside tmux; select the workspace window or use --no-attach")
 	}
-	return ExecuteContext(ctx, Command{"tmux", append(tmuxArgs, "attach-session", "-t", name)}, os.Stdin, stdout, stderr)
+	attachArgs := append(tmuxArgs, "attach-session", "-t", name)
+	if launch.scope == "workspace" {
+		attachArgs = append(attachArgs, "-c", c.Workspace.VMRoot)
+	}
+	return ExecuteContext(ctx, Command{"tmux", attachArgs}, os.Stdin, stdout, stderr)
 }
 func mustExecutable() string { p, _ := os.Executable(); return p }
 func ThemeSnapshot(ctx context.Context) ([]byte, error) {

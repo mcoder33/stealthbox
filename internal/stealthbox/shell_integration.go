@@ -12,6 +12,7 @@ import (
 
 type workspaceLaunch struct {
 	directory, label, binding, scope, agent, runner string
+	runnerPinned                                    bool
 }
 
 func runnerAlias(runner string) string {
@@ -25,6 +26,7 @@ func runnerAlias(runner string) string {
 }
 
 func resolveWorkspaceLaunch(ctx context.Context, c Config, selector, agent, runner string) (workspaceLaunch, error) {
+	runnerPinned := runner != ""
 	if p, ok := c.Projects[selector]; ok {
 		if p.Source.Host != "" {
 			return workspaceLaunch{}, fmt.Errorf("workspace command runs on the VM; use connect on the Mac")
@@ -33,7 +35,7 @@ func resolveWorkspaceLaunch(ctx context.Context, c Config, selector, agent, runn
 		if _, ok := p.Runners[runner]; !ok {
 			return workspaceLaunch{}, fmt.Errorf("unknown runner %q", runner)
 		}
-		return workspaceLaunch{directory: p.Source.Path, label: selector, binding: selector, agent: agent, runner: runner}, nil
+		return workspaceLaunch{directory: p.Source.Path, label: selector, binding: selector, agent: agent, runner: runner, runnerPinned: runnerPinned}, nil
 	}
 	if !WorkspaceRootEnabled(c) {
 		return workspaceLaunch{}, fmt.Errorf("unknown project %q", selector)
@@ -84,7 +86,7 @@ func resolveWorkspaceLaunch(ctx context.Context, c Config, selector, agent, runn
 	if len(label) > 48 {
 		label = label[:48]
 	}
-	return workspaceLaunch{directory: directory, label: fmt.Sprintf("%s-%x", label, hash[:4]), scope: "workspace", agent: agent, runner: runner}, nil
+	return workspaceLaunch{directory: directory, label: fmt.Sprintf("%s-%x", label, hash[:4]), scope: "workspace", agent: agent, runner: runner, runnerPinned: runnerPinned}, nil
 }
 
 func workspaceLaunchScript(c Config, configPath string, launch workspaceLaunch, extra []string) (string, error) {
@@ -98,7 +100,11 @@ func workspaceLaunchScript(c Config, configPath string, launch workspaceLaunch, 
 			return "", err
 		}
 	}
-	env := "export PATH=" + Quote(managedPath()) + " STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(launch.binding) + " STEALTHBOX_SCOPE=" + Quote(launch.scope) + " STEALTHBOX_RUNNER=" + Quote(launch.runner) + " STEALTHBOX_AGENT=" + Quote(launch.agent) + " STEALTHBOX_VM_ROOT=" + Quote(c.Workspace.VMRoot)
+	runnerSource := "captured"
+	if launch.scope == "workspace" && launch.agent == "shell" && !launch.runnerPinned {
+		runnerSource = "default"
+	}
+	env := "export PATH=" + Quote(managedPath()) + " STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(launch.binding) + " STEALTHBOX_SCOPE=" + Quote(launch.scope) + " STEALTHBOX_RUNNER=" + Quote(launch.runner) + " STEALTHBOX_RUNNER_SOURCE=" + Quote(runnerSource) + " STEALTHBOX_AGENT=" + Quote(launch.agent) + " STEALTHBOX_VM_ROOT=" + Quote(c.Workspace.VMRoot)
 	return env + "; exec " + shellArgs(cmd), nil
 }
 
@@ -125,8 +131,8 @@ func shellAgentFunctions() string {
 	return `
 # These functions exist only in the Stealth Box shell. exec launches the actual executable.
 unalias codex claude 2>/dev/null || true
-codex() { command stealthbox agent codex --runner "${STEALTHBOX_RUNNER:-vm}" -- "$@"; }
-claude() { command stealthbox agent claude --runner "${STEALTHBOX_RUNNER:-vm}" -- "$@"; }
+codex() { command stealthbox agent codex -- "$@"; }
+claude() { command stealthbox agent claude -- "$@"; }
 `
 }
 

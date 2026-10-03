@@ -223,6 +223,9 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 	if err != nil {
 		return err
 	}
+	if err = prepareRemoteWorkspace(ctx, *c); err != nil {
+		return err
+	}
 	if err = prepareRemoteTools(ctx, *c, stdout); err != nil {
 		return err
 	}
@@ -269,11 +272,6 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 	}
 	if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "mv "+Quote(candidate)+" "+Quote(remoteBin)+" && umask 077 && mkdir -p "+Quote(filepath.Dir(c.Bridge.RemoteSocket)), false), nil, io.Discard, io.Discard); err != nil {
 		return err
-	}
-	if WorkspaceRootEnabled(*c) {
-		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, "umask 077; mkdir -p "+Quote(c.Workspace.VMRoot), false), nil, io.Discard, io.Discard); err != nil {
-			return err
-		}
 	}
 	if err = DeployConfigWithOutput(ctx, *c, stdout); err != nil {
 		return err

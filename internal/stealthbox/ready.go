@@ -105,6 +105,12 @@ func checkRemoteTools(ctx context.Context, c Config) error {
 // EnsureReady also upgrades old installations reached through settings/bridge
 // actions, not only the main connect command.
 func EnsureReady(ctx context.Context, c *Config, path, binary string, w io.Writer) error {
+	if _, _, err := resolveRemote(ctx, c); err != nil {
+		return err
+	}
+	if err := prepareRemoteWorkspace(ctx, *c); err != nil {
+		return err
+	}
 	if c.Workspace.RemoteDir != "" {
 		probe, cancel := context.WithTimeout(ctx, 20*time.Second)
 		out, err := Output(probe, sshCommand(c.Workspace.Host, Quote(filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox"))+" handshake", false))
@@ -123,6 +129,13 @@ func EnsureReady(ctx context.Context, c *Config, path, binary string, w io.Write
 		}
 	}
 	return Setup(ctx, c, path, binary, w)
+}
+
+func prepareRemoteWorkspace(ctx context.Context, c Config) error {
+	if !WorkspaceRootEnabled(c) {
+		return nil
+	}
+	return ExecuteNoninteractiveContext(ctx, sshCommand(c.Workspace.Host, "umask 077; mkdir -p "+Quote(c.Workspace.VMRoot), false), nil, io.Discard, io.Discard)
 }
 
 // Install the terminal description in the remote user's database. A terminal

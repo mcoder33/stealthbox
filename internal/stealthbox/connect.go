@@ -32,6 +32,7 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 	if !ok && !WorkspaceRootEnabled(*c) {
 		return fmt.Errorf("unknown project")
 	}
+	runnerExplicit := o.Runner != ""
 	o.Runner = runnerAlias(o.Runner)
 	if ok {
 		o.Agent, o.Runner = Defaults(p, o.Agent, o.Runner)
@@ -56,11 +57,21 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 		return err
 	}
 	if c.Bridge.Enabled {
-		if err := StartBridgeService(ctx, *c, path, stderr); err != nil {
-			return err
+		bridgeCtx := ctx
+		cancelBridge := func() {}
+		if runnerExplicit && o.Runner == "vm" {
+			bridgeCtx, cancelBridge = context.WithTimeout(ctx, 5*time.Second)
 		}
-		if err := WaitRemoteBridge(ctx, *c); err != nil {
-			return err
+		bridgeErr := StartBridgeService(bridgeCtx, *c, path, stderr)
+		if bridgeErr == nil {
+			bridgeErr = WaitRemoteBridge(bridgeCtx, *c)
+		}
+		cancelBridge()
+		if bridgeErr != nil {
+			if !runnerExplicit || o.Runner != "vm" {
+				return bridgeErr
+			}
+			fmt.Fprintf(stderr, "Warning: Mac bridge unavailable: %v. Continuing with the explicitly selected VM workspace; local runs remain unavailable.\n", bridgeErr)
 		}
 	}
 	remoteBin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
@@ -70,7 +81,10 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		argv := []string{remoteBin, "workspace", "--config", remoteCfg, "--agent", o.Agent, "--runner", o.Runner}
+		argv := []string{remoteBin, "workspace", "--config", remoteCfg, "--agent", o.Agent}
+		if runnerExplicit {
+			argv = append(argv, "--runner", o.Runner)
+		}
 		if o.Project != "" {
 			if ok {
 				argv = append(argv, "--project", o.Project)

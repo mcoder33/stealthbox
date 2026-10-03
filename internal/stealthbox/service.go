@@ -35,7 +35,15 @@ func BridgeStatus(ctx context.Context, c Config) (BridgeState, error) {
 	return s, err
 }
 func StopBridgeService(ctx context.Context, c Config) error {
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://unix/shutdown", nil)
+	return stopBridgeService(ctx, c, false)
+}
+
+func stopBridgeService(ctx context.Context, c Config, idleOnly bool) error {
+	endpoint := "/shutdown"
+	if idleOnly {
+		endpoint = "/shutdown-idle"
+	}
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://unix"+endpoint, nil)
 	req.Header.Set("Authorization", "Bearer "+c.Bridge.Token)
 	res, err := bridgeHTTP(c.Bridge.Socket).Do(req)
 	if err != nil {
@@ -43,6 +51,12 @@ func StopBridgeService(ctx context.Context, c Config) error {
 	}
 	res.Body.Close()
 	if res.StatusCode != 200 {
+		if idleOnly {
+			if res.StatusCode == http.StatusConflict {
+				return fmt.Errorf("Mac bridge is busy; wait for local runs to finish and retry, or explicitly use bridge-stop to cancel them")
+			}
+			return fmt.Errorf("cannot safely refresh bridge: HTTP %d; use bridge-stop with its original configuration or stop its owner, then retry", res.StatusCode)
+		}
 		return fmt.Errorf("cannot stop bridge: HTTP %d (foreground unmanaged bridges need Ctrl-C)", res.StatusCode)
 	}
 	for i := 0; i < 40; i++ {
@@ -71,12 +85,14 @@ func StartBridgeService(ctx context.Context, c Config, path string, log io.Write
 		if s.ConfigHash == configHash(c) {
 			return nil
 		}
-		if e = StopBridgeService(ctx, c); e != nil {
+		if e = stopBridgeService(ctx, c, true); e != nil {
 			return e
 		}
 	} else {
-		if _, e = os.Lstat(c.Bridge.Socket); e == nil {
-			return fmt.Errorf("existing socket is unhealthy; stop its owner or remove a stale socket manually")
+		if _, socketErr := os.Lstat(c.Bridge.Socket); socketErr == nil {
+			return fmt.Errorf("existing bridge cannot be checked safely: %w; use bridge-stop with its original configuration or stop its owner, then retry; stale sockets require manual cleanup", e)
+		} else if !os.IsNotExist(socketErr) {
+			return fmt.Errorf("cannot inspect bridge socket: %w", socketErr)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(c.Bridge.Socket), 0700); err != nil {
@@ -159,17 +175,15 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 				continue
 			}
 		}
-		cleanup := "test ! -e " + Quote(c.Bridge.RemoteSocket) + " || { test -S " + Quote(c.Bridge.RemoteSocket) + " && rm -- " + Quote(c.Bridge.RemoteSocket) + "; }"
-		if err = ExecuteContext(ctx, sshCommand(c.Workspace.Host, cleanup, false), nil, io.Discard, log); err == nil {
-			cmd := sshCommand(c.Workspace.Host, "", false)
-			cmd.Args = cmd.Args[:len(cmd.Args)-1]
-			cmd.Args = append([]string{"-N", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
-			fmt.Fprintln(log, "Connecting Mac bridge to", c.Workspace.Host)
-			err = ExecuteContext(ctx, cmd, nil, io.Discard, log)
-		}
+		cmd := sshCommand(c.Workspace.Host, "", false)
+		cmd.Args = cmd.Args[:len(cmd.Args)-1]
+		cmd.Args = append([]string{"-N", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
+		fmt.Fprintln(log, "Connecting Mac bridge to", c.Workspace.Host)
+		err = ExecuteContext(ctx, cmd, nil, io.Discard, log)
 		if ctx.Err() != nil {
 			return nil
 		}
+		fmt.Fprintln(log, "Check the reverse SSH error above; an occupied remote socket needs its owner stopped or a stale socket removed manually.")
 		if err = pause(ctx, delay, log); err != nil {
 			return nil
 		}
