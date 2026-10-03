@@ -411,6 +411,10 @@ def main():
             print('PASS actual Git push/fetch pack transfer through Mac SSH credentials', flush=True)
             refreshed_env = dict(env, SB_TEST_TERMINAL_VALUE='refreshed terminal export')
             call([str(binary), 'bridge-start', '--config', str(config)], env=refreshed_env)
+            # bridge-start reports the local server; its reverse SSH tunnel
+            # reconnects asynchronously. Native Linux reaches the next command
+            # before that handshake finishes more often than Docker on macOS.
+            wait_for(lambda: remote(REMOTE_BIN, 'bridge-health', '--config', REMOTE_CONFIG) == '', 90)
             output = remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'a/api',
                             '--runner', 'vm', '--', 'sh', '-c', 'printf "%s" "$SB_TEST_TERMINAL_VALUE"')
             assert output == refreshed_env['SB_TEST_TERMINAL_VALUE'], output
