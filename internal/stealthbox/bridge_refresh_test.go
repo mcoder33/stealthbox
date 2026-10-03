@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -12,9 +13,111 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func observeBridgeHeartbeat(heartbeat string, completion func() (bool, error), pid, pgid int) error {
+	before, err := os.ReadFile(heartbeat)
+	if err != nil {
+		return fmt.Errorf("run heartbeat baseline read: %w; pid=%d pgid=%d", err, pid, pgid)
+	}
+	started := time.Now()
+	for {
+		after, err := os.ReadFile(heartbeat)
+		if err != nil {
+			return fmt.Errorf("run heartbeat read: %w; elapsed=%s pid=%d pgid=%d", err, time.Since(started), pid, pgid)
+		}
+		completed, runErr := completion()
+		diagnostic := fmt.Sprintf("elapsed=%s heartbeat=%d->%d pid=%d pgid=%d completed=%t result=%v", time.Since(started), len(before), len(after), pid, pgid, completed, runErr)
+		if completed {
+			return fmt.Errorf("run completed unexpectedly: %s", diagnostic)
+		}
+		if time.Since(started) >= 150*time.Millisecond && len(after) > len(before) {
+			return nil
+		}
+		if time.Since(started) >= 2*time.Second {
+			return fmt.Errorf("pending run made no heartbeat progress within observation bound: %s", diagnostic)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type bridgeFixtureCompletion struct {
+	done chan struct{}
+	err  error
+}
+
+func (run *bridgeFixtureCompletion) state() (bool, error) {
+	select {
+	case <-run.done:
+		return true, run.err
+	default:
+		return false, nil
+	}
+}
+
+func TestBridgeHeartbeatOracle(t *testing.T) {
+	for _, scenario := range []string{"paused_run_resumes", "killed_run", "stalled_live_run"} {
+		t.Run(scenario, func(t *testing.T) {
+			process := startHeartbeatFixtureProcess(t, filepath.Join(t.TempDir(), "heartbeat"))
+			if scenario == "killed_run" {
+				if err := syscall.Kill(-process.pgid, syscall.SIGKILL); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-process.done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("killed fixture was not reaped")
+				}
+				if err := observeBridgeHeartbeat(process.heartbeat, process.exitState, process.pid, process.pgid); err == nil || !strings.Contains(err.Error(), "run completed unexpectedly") {
+					t.Fatal("oracle did not detect a completed run:", err)
+				}
+				return
+			}
+			if err := syscall.Kill(-process.pgid, syscall.SIGSTOP); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			before, err := os.ReadFile(process.heartbeat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "stalled_live_run" {
+				started := time.Now()
+				err := observeBridgeHeartbeat(process.heartbeat, process.exitState, process.pid, process.pgid)
+				if err == nil || !strings.Contains(err.Error(), "pending run made no heartbeat progress") {
+					t.Fatal("oracle accepted or misclassified a stalled live run:", err)
+				}
+				if exited, _ := process.exitState(); exited || time.Since(started) > 3*time.Second {
+					t.Fatalf("stall check was not bounded with a live fixture: %s", process.diagnostic())
+				}
+				return
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- observeBridgeHeartbeat(process.heartbeat, process.exitState, process.pid, process.pgid)
+			}()
+			time.Sleep(200 * time.Millisecond)
+			after, err := os.ReadFile(process.heartbeat)
+			if exited, _ := process.exitState(); err != nil || exited || !bytes.Equal(before, after) {
+				t.Fatalf("controlled pause was not stable/alive: %d->%d read=%v; %s", len(before), len(after), err, process.diagnostic())
+			}
+			if err := syscall.Kill(-process.pgid, syscall.SIGCONT); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal("oracle mistook a paused live run for a killed run:", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("heartbeat oracle exceeded its observation bound")
+			}
+		})
+	}
+}
 
 func TestBridgeRefreshPreservesBusyRunThenAppliesConfig(t *testing.T) {
 	localDeploymentSSH(t)
@@ -51,21 +154,59 @@ func TestBridgeRefreshPreservesBusyRunThenAppliesConfig(t *testing.T) {
 	})
 	heartbeat := filepath.Join(root, "heartbeat")
 	finish := filepath.Join(root, "finish")
-	runDone := make(chan error, 1)
+	pidPath := filepath.Join(root, "command.pid")
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	run := &bridgeFixtureCompletion{done: make(chan struct{})}
 	go func() {
-		runDone <- RunBridge(context.Background(), c, "test", []string{"sh", "-c", "while [ ! -f " + Quote(finish) + " ]; do printf x >> " + Quote(heartbeat) + "; sleep 0.02; done"}, false, "", io.Discard, io.Discard)
+		run.err = RunBridge(runCtx, c, "test", []string{"sh", "-c", "echo $$ > " + Quote(pidPath) + "; while [ ! -f " + Quote(finish) + " ]; do printf x >> " + Quote(heartbeat) + "; sleep 0.02; done"}, false, "", io.Discard, io.Discard)
+		close(run.done)
 	}()
-	waitForFixtureFile(t, heartbeat)
+	pid, pgid := 0, 0
+	t.Cleanup(func() {
+		if completed, _ := run.state(); !completed {
+			if group, err := syscall.Getpgid(pid); pid > 0 && err == nil && group == pgid && pgid == pid && pgid != syscall.Getpgrp() {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			}
+		}
+		cancelRun()
+		select {
+		case <-run.done:
+		case <-time.After(3 * time.Second):
+			t.Error("owned bridge request did not finish after cleanup")
+		}
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if completed, err := run.state(); completed {
+			t.Fatal("bridge run completed before readiness:", err)
+		}
+		data, err := os.ReadFile(heartbeat)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal("run heartbeat readiness read:", err)
+		}
+		if err == nil && len(data) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bridge run heartbeat did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	pid = readProcessFixturePID(pidPath)
+	pgid, err = syscall.Getpgid(pid)
+	if pid <= 0 || err != nil || pgid != pid || pgid == syscall.Getpgrp() {
+		t.Fatalf("bridge fixture lacks a private process group: pid=%d pgid=%d error=%v", pid, pgid, err)
+	}
+	if err := observeBridgeHeartbeat(heartbeat, run.state, pid, pgid); err != nil {
+		t.Fatal("bridge run did not establish progress before refresh:", err)
+	}
 	changed := c
 	changed.Bridge.TimeoutSeconds++
 	if err := StartBridgeService(ctx, changed, filepath.Join(root, "config.json"), io.Discard); err == nil || !strings.Contains(err.Error(), "busy") {
 		t.Fatal("busy bridge was automatically restarted")
 	}
-	before, _ := os.ReadFile(heartbeat)
-	time.Sleep(150 * time.Millisecond)
-	after, _ := os.ReadFile(heartbeat)
-	if len(after) <= len(before) {
-		t.Fatal("automatic config refresh killed ongoing local run")
+	if err := observeBridgeHeartbeat(heartbeat, run.state, pid, pgid); err != nil {
+		t.Fatal("busy bridge run after automatic refresh:", err)
 	}
 	if state, err := BridgeStatus(context.Background(), c); err != nil || state.ConfigHash != configHash(c) {
 		t.Fatal("busy bridge configuration changed", err)
@@ -74,9 +215,9 @@ func TestBridgeRefreshPreservesBusyRunThenAppliesConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case err := <-runDone:
-		if err != nil {
-			t.Fatal(err)
+	case <-run.done:
+		if run.err != nil {
+			t.Fatal(run.err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("local run did not finish")
