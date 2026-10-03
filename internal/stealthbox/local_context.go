@@ -36,6 +36,11 @@ func remoteLocalContext(c Config) bool {
 	return LocalContextEnabled(c) && c.Bridge.RemoteSocket != "" && c.Bridge.Socket == c.Bridge.RemoteSocket
 }
 
+func localContextLaunch(c Config) bool {
+	_, inherited := os.LookupEnv("STEALTHBOX_LOCAL_ENV_KEYS")
+	return remoteLocalContext(c) || inherited && c.Bridge.RemoteSocket != "" && c.Bridge.Socket == c.Bridge.RemoteSocket
+}
+
 func transferableEnvironment(name string) bool {
 	if !environmentName.MatchString(name) {
 		return false
@@ -133,10 +138,21 @@ func contextEnvironment(ctx context.Context, c Config, configPath string) ([]str
 			environment[name] = value
 		}
 	}
-	if remoteLocalContext(c) {
+	if localContextLaunch(c) {
 		for _, name := range strings.Split(os.Getenv("STEALTHBOX_LOCAL_ENV_KEYS"), ",") {
 			if transferableEnvironment(name) {
 				delete(environment, name)
+			}
+		}
+		if !remoteLocalContext(c) {
+			delete(environment, "STEALTHBOX_LOCAL_ENV_KEYS")
+			for name := range environment {
+				if strings.HasPrefix(name, "GIT_CONFIG_") || name == "GIT_SSH_COMMAND" || name == "GIT_SSH_VARIANT" {
+					delete(environment, name)
+				}
+			}
+			if environment["SSH_AUTH_SOCK"] == credentialAgentSocket(c) {
+				delete(environment, "SSH_AUTH_SOCK")
 			}
 		}
 	}

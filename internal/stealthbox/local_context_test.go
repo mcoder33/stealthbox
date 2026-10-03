@@ -136,6 +136,20 @@ func TestLocalContextAuthorizationAndOptOut(t *testing.T) {
 	if !transferableEnvironment("GITLAB_TOKEN") || !transferableEnvironment("DATABASE_URL") {
 		t.Fatal("required exported variables filtered")
 	}
+	t.Setenv("STEALTHBOX_LOCAL_ENV_KEYS", "TEST_SERVICE_TOKEN")
+	t.Setenv("TEST_SERVICE_TOKEN", "old exported secret")
+	t.Setenv("GIT_CONFIG_COUNT", "3")
+	t.Setenv("GIT_SSH_COMMAND", "old bridge helper")
+	t.Setenv("SSH_AUTH_SOCK", credentialAgentSocket(c))
+	env, err := contextEnvironment(context.Background(), c, "config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"TEST_SERVICE_TOKEN", "GIT_CONFIG_COUNT", "GIT_SSH_COMMAND", "SSH_AUTH_SOCK", "STEALTHBOX_LOCAL_ENV_KEYS"} {
+		if envValue(env, key) != "" {
+			t.Fatal("opt-out retained inherited local context", key)
+		}
+	}
 }
 
 func TestGitCredentialUsesMacRepositoryHelper(t *testing.T) {

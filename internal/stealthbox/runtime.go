@@ -111,7 +111,7 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 				return err
 			}
 		}
-		if runner == "vm" && dst.Host == "" && remoteLocalContext(c) {
+		if runner == "vm" && dst.Host == "" && localContextLaunch(c) {
 			configPath := os.Getenv("STEALTHBOX_CONFIG")
 			if configPath == "" {
 				configPath = filepath.Join(c.Workspace.RemoteDir, "config.json")
