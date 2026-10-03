@@ -196,3 +196,28 @@ func TestSourceGitIgnoreTransferOnlyUsesCurrentManifests(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceGitIgnoreRejectsReceiverDirectoryTypeCollision(t *testing.T) {
+	for _, direction := range []string{"import", "export"} {
+		t.Run(direction, func(t *testing.T) {
+			c := sourceTestConfig(t)
+			source, destination := c.Workspace.LocalRoot, c.Workspace.VMRoot
+			if direction == "export" {
+				source, destination = destination, source
+			}
+			writeSourceFile(t, source, "repo/runtime", "source file with a directory name")
+			writeSourceFile(t, destination, "repo/.gitignore", "runtime/\n")
+			writeSourceFile(t, destination, "repo/runtime/local.txt", "receiver data")
+			plan := filepath.Join(t.TempDir(), "plan.json")
+			if err := PreviewSourceSync(context.Background(), c, direction, "repo", true, plan, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "conflicts with an ignored path") {
+				t.Fatal("ignored receiver directory could be replaced by a file", err)
+			}
+			if got, err := os.ReadFile(filepath.Join(destination, "repo/runtime/local.txt")); err != nil || string(got) != "receiver data" {
+				t.Fatal("preview changed ignored receiver data", string(got), err)
+			}
+			if _, err := os.Stat(plan); !os.IsNotExist(err) {
+				t.Fatal("unsafe plan was created", err)
+			}
+		})
+	}
+}
