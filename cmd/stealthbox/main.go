@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -117,8 +118,9 @@ func run(ctx context.Context, args []string) error {
 	shellIntegration := f.Bool("shell-integration", false, "wrap codex/claude only in the managed workspace shell")
 	plan := f.String("plan", "", "reviewed source sync plan file")
 	expectedHash := f.String("expected-hash", "", "expected destination fingerprint (internal source prepare)")
-	sourceExcludes := f.String("source-excludes", "", "JSON exclusion paths (internal source fingerprint/prepare)")
-	sourceSafeLinks := f.Bool("source-safe-links", false, "preserve safe relative symlinks (internal source fingerprint/prepare)")
+	sourceExcludes := f.String("source-excludes", "", "JSON exclusion paths (internal source ignore/fingerprint/prepare)")
+	sourceSafeLinks := f.Bool("source-safe-links", false, "preserve safe relative symlinks (internal source ignore/fingerprint/prepare)")
+	ignoreRulesStdin := f.Bool("source-ignore-rules-stdin", false, "read shared .gitignore rules from stdin (internal source fingerprint/prepare)")
 	macPath := f.String("mac-path", "", "dedicated disposable Mac runner path")
 	remove := f.Bool("delete", false, "remove project from config; keep files")
 	enableMac := f.Bool("enable-mac", false, "enable Mac runner bridge")
@@ -375,8 +377,8 @@ func run(ctx context.Context, args []string) error {
 		return stealthbox.ServeMCP(ctx, c, os.Stdin, os.Stdout)
 	case "source":
 		if visited["source-excludes"] || visited["source-safe-links"] {
-			if sourceAction != "fingerprint" && sourceAction != "prepare" {
-				return fmt.Errorf("--source-excludes and --source-safe-links are only for internal source fingerprint/prepare")
+			if sourceAction != "fingerprint" && sourceAction != "prepare" && sourceAction != "ignore" {
+				return fmt.Errorf("--source-excludes and --source-safe-links are only for internal source ignore/fingerprint/prepare")
 			}
 			if visited["source-excludes"] {
 				if err = json.Unmarshal([]byte(*sourceExcludes), &c.Workspace.SourceExcludes); err != nil {
@@ -389,6 +391,24 @@ func run(ctx context.Context, args []string) error {
 			if err = c.Validate(); err != nil {
 				return err
 			}
+		}
+		var rules []stealthbox.SourceIgnoreRules
+		if *ignoreRulesStdin {
+			if sourceAction != "fingerprint" && sourceAction != "prepare" {
+				return fmt.Errorf("--source-ignore-rules-stdin is only for internal source fingerprint/prepare")
+			}
+			data, err := io.ReadAll(io.LimitReader(os.Stdin, (1<<20)+1))
+			if err != nil {
+				return err
+			}
+			if len(data) > 1<<20 {
+				return fmt.Errorf("source .gitignore rules exceed 1 MiB")
+			}
+			var shared stealthbox.SourceIgnoreRules
+			if err = json.Unmarshal(data, &shared); err != nil {
+				return fmt.Errorf("invalid source .gitignore rules: %w", err)
+			}
+			rules = append(rules, shared)
 		}
 		switch sourceAction {
 		case "import", "export":
@@ -404,7 +424,7 @@ func run(ctx context.Context, args []string) error {
 			}
 			return stealthbox.ApplySourceSync(ctx, c, *plan, os.Stdout)
 		case "fingerprint":
-			state, e := stealthbox.SourceFingerprint(ctx, c, *sourcePath)
+			state, e := stealthbox.SourceFingerprint(ctx, c, *sourcePath, rules...)
 			if e != nil {
 				return e
 			}
@@ -413,7 +433,13 @@ func run(ctx context.Context, args []string) error {
 			if *dry {
 				return fmt.Errorf("--dry-run cannot prepare a source destination")
 			}
-			return stealthbox.PrepareSourceDestination(ctx, c, *sourcePath, *expectedHash)
+			return stealthbox.PrepareSourceDestination(ctx, c, *sourcePath, *expectedHash, rules...)
+		case "ignore":
+			files, err := stealthbox.SourceIgnoreFiles(ctx, c, *sourcePath)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(files)
 		default:
 			return fmt.Errorf("source action must be import, export or apply")
 		}
