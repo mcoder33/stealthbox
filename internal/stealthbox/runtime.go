@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
+	"time"
 )
 
 func ExecuteContext(ctx context.Context, c Command, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -15,6 +17,31 @@ func ExecuteContext(ctx context.Context, c Command, stdin io.Reader, stdout, std
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+// ExecuteNoninteractiveContext owns the local command's process group. This
+// does not guarantee cancellation of a command behind an SSH connection.
+func ExecuteNoninteractiveContext(ctx context.Context, c Command, stdin io.Reader, stdout, stderr io.Writer) error {
+	cmd := exec.CommandContext(ctx, c.Program, c.Args...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 2 * time.Second
+	err := cmd.Run()
+	// The context watcher may stop when the leader exits, before inherited
+	// pipes close. WaitDelay only closes those pipes and can be hidden by an
+	// ExitError, so clean up the remaining group on every failed execution.
+	if cmd.Process != nil && (ctx.Err() != nil || err != nil) {
+		_ = cmd.Cancel()
+	}
+	return err
 }
 func Run(ctx context.Context, c Config, name, runner string, args []string, snapshot bool, cwd string, stdout, stderr io.Writer) error {
 	resolved, err := ResolveProject(ctx, c, name, cwd)
@@ -45,7 +72,7 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 		if err != nil {
 			return err
 		}
-		return ExecuteContext(ctx, At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false), nil, stdout, stderr)
+		return ExecuteNoninteractiveContext(ctx, At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false), nil, stdout, stderr)
 	}
 	if !snapshot || (p.Source.Host == dst.Host && filepath.Clean(p.Source.Path) == filepath.Clean(dst.Path)) {
 		return execute()
@@ -55,7 +82,7 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 		return err
 	}
 	for _, cmd := range cmds[:len(cmds)-1] {
-		if err = ExecuteContext(ctx, cmd, nil, stdout, stderr); err != nil {
+		if err = ExecuteNoninteractiveContext(ctx, cmd, nil, stdout, stderr); err != nil {
 			return err
 		}
 	}

@@ -19,7 +19,8 @@ import (
 
 func sshCommand(host, script string, tty bool) Command { return At(Endpoint{Host: host}, script, tty) }
 func upload(ctx context.Context, host, path string, content io.Reader) error {
-	script := "umask 077; mkdir -p " + Quote(filepath.Dir(path)) + " && cat > " + Quote(path+".tmp") + " && mv " + Quote(path+".tmp") + " " + Quote(path)
+	script := "set -eu; umask 077; mkdir -p " + Quote(filepath.Dir(path)) +
+		"; upload_tmp=$(mktemp " + Quote(path+".tmp.XXXXXX") + "); trap 'rm -f \"$upload_tmp\"' EXIT; trap 'exit 1' HUP INT TERM; cat > \"$upload_tmp\"; mv \"$upload_tmp\" " + Quote(path)
 	var stderr bytes.Buffer
 	if err := ExecuteContext(ctx, sshCommand(host, script, false), content, io.Discard, &stderr); err != nil {
 		return fmt.Errorf("upload %s: %w: %s", filepath.Base(path), err, stderr.String())
@@ -242,7 +243,20 @@ func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.
 	}
 	defer file.Close()
 	remoteBin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
-	candidate := remoteBin + ".candidate"
+	candidateOutput, err := Output(ctx, sshCommand(c.Workspace.Host,
+		"set -eu; umask 077; mkdir -p "+Quote(filepath.Dir(remoteBin))+"; mktemp "+Quote(remoteBin+".candidate.XXXXXX"), false))
+	if err != nil {
+		return fmt.Errorf("create VM binary candidate: %w", err)
+	}
+	candidate := strings.TrimSpace(string(candidateOutput))
+	if !strings.HasPrefix(candidate, remoteBin+".candidate.") || strings.ContainsAny(candidate, "\n\r\x00") {
+		return fmt.Errorf("unexpected VM binary candidate path")
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = ExecuteNoninteractiveContext(cleanup, sshCommand(c.Workspace.Host, "rm -f "+Quote(candidate), false), nil, io.Discard, io.Discard)
+	}()
 	if err = upload(ctx, c.Workspace.Host, candidate, file); err != nil {
 		return err
 	}

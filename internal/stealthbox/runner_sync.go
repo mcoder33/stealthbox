@@ -6,13 +6,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 )
 
 func runnerSyncTransport(c Config, p Project) string {
@@ -194,16 +191,5 @@ func runnerSyncFailure(stage string, err error, output *runnerSyncErrorOutput) e
 }
 
 func executeRunnerSync(ctx context.Context, command Command, stdout, stderr io.Writer) error {
-	cmd := exec.CommandContext(ctx, command.Program, command.Args...)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = 2 * time.Second
-	return cmd.Run()
+	return ExecuteNoninteractiveContext(ctx, command, nil, stdout, stderr)
 }
