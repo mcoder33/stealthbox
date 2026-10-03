@@ -50,6 +50,7 @@ type Forward struct {
 }
 type BridgeConfig struct {
 	Enabled        bool   `json:"enabled"`
+	LocalContext   *bool  `json:"local_context,omitempty"`
 	Socket         string `json:"socket"`
 	RemoteSocket   string `json:"remote_socket"`
 	Token          string `json:"token,omitempty"`

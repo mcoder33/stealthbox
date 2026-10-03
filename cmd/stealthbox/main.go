@@ -133,12 +133,16 @@ func run(ctx context.Context, args []string) error {
 	artifact := f.String("file", "", "artifact path relative to Mac runner")
 	output := f.String("output", "", "local output file (must not exist)")
 	edit := f.Bool("edit", false, "edit config with EDITOR")
+	localContext := f.Bool("local-context", true, "use local terminal environment and Git credentials on the VM")
 	if err = f.Parse(parseArgs); err != nil {
 		return err
 	}
 	visited := map[string]bool{}
 	f.Visit(func(value *flag.Flag) { visited[value.Name] = true })
 	applyWorkspaceFlags := func(c *stealthbox.Config) error {
+		if visited["local-context"] {
+			c.Bridge.LocalContext = localContext
+		}
 		oldHost, oldRoot := c.Workspace.Host, c.Workspace.VMRoot
 		if visited["host"] {
 			c.Workspace.Host = *host
@@ -231,7 +235,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		changed := false
-		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration", "runner"} {
+		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration", "runner", "local-context"} {
 			changed = changed || visited[name]
 		}
 		if changed {
@@ -375,9 +379,30 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.ServeMCP(ctx, c, os.Stdin, os.Stdout)
+	case "context-exec":
+		if *dry {
+			return nil
+		}
+		return stealthbox.RunWithLocalContext(ctx, c, *config, f.Args(), os.Stdin, os.Stdout, os.Stderr)
+	case "git-ssh":
+		if *dry {
+			fmt.Println("Would open Git SSH transport through the Mac bridge")
+			return nil
+		}
+		return stealthbox.GitSSH(ctx, c, f.Args(), os.Stdin, os.Stdout, os.Stderr)
+	case "credential-agent":
+		if *dry {
+			return nil
+		}
+		return stealthbox.ServeCredentialAgent(ctx, c, *config)
+	case "git-credential":
+		if *dry || len(f.Args()) != 1 {
+			return nil
+		}
+		return stealthbox.GitCredential(ctx, c, f.Args()[0], os.Stdin, os.Stdout)
 	case "source":
 		if visited["source-excludes"] || visited["source-safe-links"] {
-			if sourceAction != "fingerprint" && sourceAction != "prepare" && sourceAction != "ignore" {
+			if sourceAction != "fingerprint" && sourceAction != "prepare" && sourceAction != "ignore" && sourceAction != "git-bootstrap" {
 				return fmt.Errorf("--source-excludes and --source-safe-links are only for internal source ignore/fingerprint/prepare")
 			}
 			if visited["source-excludes"] {
@@ -411,6 +436,11 @@ func run(ctx context.Context, args []string) error {
 			rules = append(rules, shared)
 		}
 		switch sourceAction {
+		case "git-bootstrap":
+			if *dry {
+				return fmt.Errorf("--dry-run cannot bootstrap Git metadata")
+			}
+			return stealthbox.BootstrapSourceGit(ctx, c, *sourcePath, os.Stdin)
 		case "import", "export":
 			if *dry {
 				fmt.Printf("Would preview %s %s without changing source files; plan=%s delete=%t\n", sourceAction, *sourcePath, *plan, *remove)

@@ -199,6 +199,9 @@ func TestWorkspaceAttachUpdatesRootPreservesExplicitDirectories(t *testing.T) {
 func TestTUIContinueUsesCurrentDefaultInRetainedShell(t *testing.T) {
 	tmux := isolatedTmux(t)
 	c := reconnectFixture(t)
+	// This fixture exercises runner selection without a Mac bridge server.
+	localContext := false
+	c.Bridge.LocalContext = &localContext
 	c.Bridge.Enabled = false
 	cli := privateWorkspaceCLI(t)
 	data, err := os.ReadFile(cli)

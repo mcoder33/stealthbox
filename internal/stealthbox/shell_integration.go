@@ -105,6 +105,9 @@ func workspaceLaunchScript(c Config, configPath string, launch workspaceLaunch, 
 		runnerSource = "default"
 	}
 	env := "export PATH=" + Quote(managedPath()) + " STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(launch.binding) + " STEALTHBOX_SCOPE=" + Quote(launch.scope) + " STEALTHBOX_RUNNER=" + Quote(launch.runner) + " STEALTHBOX_RUNNER_SOURCE=" + Quote(runnerSource) + " STEALTHBOX_AGENT=" + Quote(launch.agent) + " STEALTHBOX_VM_ROOT=" + Quote(c.Workspace.VMRoot)
+	if remoteLocalContext(c) {
+		cmd = append([]string{mustExecutable(), "context-exec", "--config", configPath, "--"}, cmd...)
+	}
 	return env + "; exec " + shellArgs(cmd), nil
 }
 

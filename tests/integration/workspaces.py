@@ -76,6 +76,8 @@ def main():
         process = None
         master = None
         env = dict(os.environ, STEALTHBOX_SSH_CONFIG=str(ssh_config), TERM='xterm-256color')
+        env['SSH_AUTH_SOCK'] = ''
+        env['SB_TEST_TERMINAL_VALUE'] = 'terminal value with spaces = literal'
         env.pop('TMUX', None)
         env.pop('STEALTHBOX_PROJECT', None)
         env.pop('STEALTHBOX_SCOPE', None)
@@ -182,6 +184,18 @@ def main():
             assert deployed['workspace'].get('host', '') == '', deployed
             assert deployed['workspace']['vm_root'] == VM_ROOT, deployed
             print('PASS root deployment, remote HOME expansion, reverse bridge + true rsync mode', flush=True)
+            output = remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'a/api',
+                            '--runner', 'vm', '--', 'sh', '-c',
+                            'test "$HOME" = /home/developer && printf "%s" "$SB_TEST_TERMINAL_VALUE"')
+            assert output == env['SB_TEST_TERMINAL_VALUE'], output
+            remote('git', 'clone', '--quiet', '--bare', f'{VM_ROOT}/a/api', '/home/developer/seed.git')
+            output = remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'a/api',
+                            '--runner', 'vm', '--', 'git', 'ls-remote',
+                            'ssh://developer@sb-workspace/home/developer/seed.git', 'HEAD')
+            assert 'HEAD' in output, output
+            # The hostname alias, known_hosts and private identity exist only
+            # on the Mac. Git's SSH connection must be opened there.
+            print('PASS terminal exports preserve VM HOME; Git SSH uses Mac alias and private identity', flush=True)
             output = remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'a/api/tests',
                             '--runner', 'local', '--', 'docker', 'compose', '-f', '../compose.yaml',
                             'run', '--rm', 'smoke')
@@ -357,6 +371,50 @@ def main():
             assert (local_source / 'ignored.log').read_text() == 'sender generated log'
             assert not (local_source / 'stale.txt').exists()
             print('PASS automatic .gitignore over SSH in both directions; negation + receiver-only runtime survive --delete', flush=True)
+            git_url = 'ssh://developer@sb-workspace/home/developer/seed.git'
+            for name in ['one', 'two']:
+                repo = local_root / 'imported' / name
+                repo.mkdir(parents=True)
+                (repo / 'code.txt').write_text('committed')
+                call(['git', '-C', str(repo), 'init', '-b', 'main'])
+                call(['git', '-C', str(repo), 'add', 'code.txt'])
+                call(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c',
+                      'user.email=fixture@example.invalid', 'commit', '-m', 'fixture'])
+                call(['git', '-C', str(repo), 'remote', 'add', 'origin', git_url])
+                call(['git', '-C', str(repo), 'config', 'credential.helper',
+                      "!f() { printf 'username=fixture\\npassword=fixture-only-secret\\n'; }; f"])
+                (repo / 'code.txt').write_text('uncommitted')
+            git_plan = temporary / 'git-import.json'
+            preview = call([str(binary), 'source', 'import', '--config', str(config), '--path',
+                            'imported', '--plan', str(git_plan)], env=env)
+            assert 'git-init\tone' in preview and 'git-init\ttwo' in preview, preview
+            call([str(binary), 'source', 'apply', '--config', str(config), '--plan', str(git_plan)], env=env)
+            for name in ['one', 'two']:
+                repo = f'{VM_ROOT}/imported/{name}'
+                assert remote('git', '-C', repo, 'rev-parse', '--is-inside-work-tree') == 'true\n'
+                assert remote('cat', repo + '/code.txt') == 'uncommitted'
+                assert remote('git', '-C', repo, 'symbolic-ref', 'HEAD') == 'refs/heads/main\n'
+                assert remote('git', '-C', repo, 'remote', 'get-url', 'origin').strip() == git_url
+                assert 'fixture-only-secret' not in remote('git', '-C', repo, 'config', '--local', '--list')
+                output = remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path',
+                                'imported/' + name, '--runner', 'vm', '--', 'sh', '-c',
+                                "printf 'protocol=https\\nhost=fixture.invalid\\n\\n' | git credential fill")
+                assert 'password=fixture-only-secret' in output
+            print('PASS two imported Git repositories have history, dirty files and Mac HTTPS credentials', flush=True)
+            remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'imported/one',
+                   '--runner', 'vm', '--', 'git', 'push', 'origin', 'HEAD:refs/heads/context-smoke')
+            remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'imported/two',
+                   '--runner', 'vm', '--', 'git', 'fetch', 'origin', 'refs/heads/context-smoke')
+            expected_head = remote('git', '-C', f'{VM_ROOT}/imported/one', 'rev-parse', 'HEAD').strip()
+            fetched_head = remote('git', '-C', f'{VM_ROOT}/imported/two', 'rev-parse', 'FETCH_HEAD').strip()
+            assert expected_head == fetched_head
+            print('PASS actual Git push/fetch pack transfer through Mac SSH credentials', flush=True)
+            refreshed_env = dict(env, SB_TEST_TERMINAL_VALUE='refreshed terminal export')
+            call([str(binary), 'bridge-start', '--config', str(config)], env=refreshed_env)
+            output = remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'a/api',
+                            '--runner', 'vm', '--', 'sh', '-c', 'printf "%s" "$SB_TEST_TERMINAL_VALUE"')
+            assert output == refreshed_env['SB_TEST_TERMINAL_VALUE'], output
+            print('PASS idle bridge refresh delivers changed terminal exports', flush=True)
             print('ALL WORKSPACE E2E CHECKS PASSED', flush=True)
         finally:
             if config.exists():

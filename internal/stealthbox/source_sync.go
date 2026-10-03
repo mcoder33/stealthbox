@@ -25,32 +25,35 @@ type SourceEntry struct {
 	Target string `json:"target,omitempty"`
 }
 type SourceState struct {
-	Hash         string            `json:"hash"`
-	Exists       bool              `json:"exists"`
-	Entries      []SourceEntry     `json:"entries,omitempty"`
-	IgnoredPaths []string          `json:"ignored_paths,omitempty"`
-	IgnoreRules  SourceIgnoreRules `json:"-"`
+	Hash            string                `json:"hash"`
+	Exists          bool                  `json:"exists"`
+	Entries         []SourceEntry         `json:"entries,omitempty"`
+	IgnoredPaths    []string              `json:"ignored_paths,omitempty"`
+	IgnoreRules     SourceIgnoreRules     `json:"-"`
+	GitRepositories []SourceGitRepository `json:"git_repositories,omitempty"`
 }
 type SourceChange struct {
 	Action string `json:"action"`
 	Path   string `json:"path"`
 }
 type SourceSyncPlan struct {
-	Version              int            `json:"version"`
-	WorkspaceID          string         `json:"workspace_id"`
-	Host                 string         `json:"host"`
-	VMRoot               string         `json:"vm_root"`
-	LocalRoot            string         `json:"local_root"`
-	RelativePath         string         `json:"relative_path"`
-	Direction            string         `json:"direction"`
-	Delete               bool           `json:"delete"`
-	SourceHash           string         `json:"source_hash"`
-	DestinationHash      string         `json:"destination_hash"`
-	Changes              []SourceChange `json:"changes"`
-	SourceExcludes       []string       `json:"source_excludes,omitempty"`
-	SourceSafeLinks      bool           `json:"source_safe_links,omitempty"`
-	SourceGitIgnore      bool           `json:"source_gitignore,omitempty"`
-	GitIgnoreIncludeFile string         `json:"-"`
+	Version              int                   `json:"version"`
+	WorkspaceID          string                `json:"workspace_id"`
+	Host                 string                `json:"host"`
+	VMRoot               string                `json:"vm_root"`
+	LocalRoot            string                `json:"local_root"`
+	RelativePath         string                `json:"relative_path"`
+	Direction            string                `json:"direction"`
+	Delete               bool                  `json:"delete"`
+	SourceHash           string                `json:"source_hash"`
+	DestinationHash      string                `json:"destination_hash"`
+	Changes              []SourceChange        `json:"changes"`
+	SourceExcludes       []string              `json:"source_excludes,omitempty"`
+	SourceSafeLinks      bool                  `json:"source_safe_links,omitempty"`
+	SourceGitIgnore      bool                  `json:"source_gitignore,omitempty"`
+	SourceGit            bool                  `json:"source_git,omitempty"`
+	GitBootstrap         []SourceGitRepository `json:"git_bootstrap,omitempty"`
+	GitIgnoreIncludeFile string                `json:"-"`
 }
 
 func sourceRelativePath(path string) (string, error) {
@@ -238,6 +241,14 @@ func sourceStateAtWithOptions(ctx context.Context, root, relative string, source
 		Entries []SourceEntry
 		Rules   SourceIgnoreRules
 	}{state.Entries, rules})
+	state.GitRepositories, err = sourceGitRepositories(ctx, path, state.Entries)
+	if err != nil {
+		return state, err
+	}
+	if len(state.GitRepositories) > 0 {
+		metadata, _ := json.Marshal(state.GitRepositories)
+		b = append(b, metadata...)
+	}
 	sum := sha256.Sum256(b)
 	state.Hash = hex.EncodeToString(sum[:])
 	return state, nil
@@ -537,6 +548,8 @@ func PreviewSourceSync(ctx context.Context, c Config, direction, path string, re
 	plan.SourceExcludes, _ = canonicalSourceExcludes(c.Workspace.SourceExcludes)
 	plan.SourceSafeLinks = c.Workspace.SourceSafeLinks
 	plan.SourceGitIgnore = true
+	plan.SourceGit = true
+	plan.GitBootstrap = sourceGitBootstrap(source, destination, direction)
 	b, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		return err
@@ -561,6 +574,9 @@ func PreviewSourceSync(ctx context.Context, c Config, direction, path string, re
 	fmt.Fprintf(w, "Preview %s %s: %d changes; delete=%t. Source files were not changed.\n", direction, path, len(plan.Changes), remove)
 	for _, change := range plan.Changes {
 		fmt.Fprintf(w, "%s\t%s\n", change.Action, change.Path)
+	}
+	for _, repo := range plan.GitBootstrap {
+		fmt.Fprintf(w, "git-init\t%s (history and branches; existing VM repositories are preserved)\n", repo.Path)
 	}
 	fmt.Fprintf(w, "Review %s, then: stealthbox source apply --plan %s\n", planFile, Quote(planFile))
 	return nil
@@ -672,6 +688,9 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	if !plan.SourceGitIgnore {
 		return fmt.Errorf("source .gitignore policy changed; generate a new plan")
 	}
+	if !plan.SourceGit {
+		return fmt.Errorf("source Git policy changed; generate a new plan")
+	}
 	currentExcludes, _ := canonicalSourceExcludes(c.Workspace.SourceExcludes)
 	planExcludes, err := canonicalSourceExcludes(plan.SourceExcludes)
 	if err != nil {
@@ -716,6 +735,14 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	if JSONString(sourceChanges(source, destination, plan.Delete)) != JSONString(plan.Changes) {
 		return fmt.Errorf("source plan change list does not match its fingerprints")
 	}
+	if JSONString(sourceGitBootstrap(source, destination, plan.Direction)) != JSONString(plan.GitBootstrap) {
+		return fmt.Errorf("source Git bootstrap list does not match its fingerprints")
+	}
+	bundles, cleanup, err := prepareSourceGitBundles(ctx, c, path, plan.GitBootstrap)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	plan.GitIgnoreIncludeFile, err = sourceIgnoreIncludeFile(source, destination)
 	if err != nil {
 		return err
@@ -750,6 +777,9 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	}
 	if err = ExecuteContext(ctx, command, nil, w, w); err != nil {
 		return err
+	}
+	if err = applySourceGitBundles(ctx, c, path, plan.GitBootstrap, bundles, w); err != nil {
+		return fmt.Errorf("source files transferred, but Git bootstrap failed: %w", err)
 	}
 	fmt.Fprintf(w, "Applied %s %s. Keep source edits paused during an apply.\n", plan.Direction, path)
 	return nil

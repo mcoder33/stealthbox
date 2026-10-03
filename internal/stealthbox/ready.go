@@ -16,7 +16,7 @@ import (
 // which predate prepared workspaces, even when their release name is "dev".
 var BuildVersion = "dev"
 
-func Handshake() string { return "stealthbox-ready-v1 " + BuildVersion }
+func Handshake() string { return "stealthbox-ready-v2 " + BuildVersion }
 
 func managedPath() string {
 	return managedBins() + string(os.PathListSeparator) + os.Getenv("PATH")
