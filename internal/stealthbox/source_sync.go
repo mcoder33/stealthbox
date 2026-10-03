@@ -25,10 +25,11 @@ type SourceEntry struct {
 	Target string `json:"target,omitempty"`
 }
 type SourceState struct {
-	Hash        string            `json:"hash"`
-	Exists      bool              `json:"exists"`
-	Entries     []SourceEntry     `json:"entries,omitempty"`
-	IgnoreRules SourceIgnoreRules `json:"-"`
+	Hash         string            `json:"hash"`
+	Exists       bool              `json:"exists"`
+	Entries      []SourceEntry     `json:"entries,omitempty"`
+	IgnoredPaths []string          `json:"ignored_paths,omitempty"`
+	IgnoreRules  SourceIgnoreRules `json:"-"`
 }
 type SourceChange struct {
 	Action string `json:"action"`
@@ -176,6 +177,7 @@ func sourceStateAtWithOptions(ctx context.Context, root, relative string, source
 			return err
 		}
 		if ignored {
+			state.IgnoredPaths = append(state.IgnoredPaths, filepath.ToSlash(rel))
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -423,6 +425,25 @@ func sourceSyncStates(ctx context.Context, c Config, path, direction string) (So
 	remote, err := remoteSourceState(ctx, c, path, rules)
 	if err != nil {
 		return SourceState{}, SourceState{}, err
+	}
+	// A directory-only ignore may allow a regular file at the same path on
+	// the other side. Reject that collision before rsync can replace the
+	// receiver's protected directory with the sender's file.
+	for _, pair := range [][2]SourceState{{local, remote}, {remote, local}} {
+		ignored := make(map[string]bool, len(pair[0].IgnoredPaths))
+		for _, path := range pair[0].IgnoredPaths {
+			ignored[path] = true
+		}
+		for _, entry := range pair[1].Entries {
+			if entry.Path != "." && (!filepath.IsLocal(entry.Path) || filepath.ToSlash(filepath.Clean(entry.Path)) != entry.Path || strings.ContainsAny(entry.Path, "\x00\n\r")) {
+				return SourceState{}, SourceState{}, fmt.Errorf("invalid source manifest path %q", entry.Path)
+			}
+			for path := entry.Path; path != "."; path = filepath.ToSlash(filepath.Dir(path)) {
+				if ignored[path] {
+					return SourceState{}, SourceState{}, fmt.Errorf("source path %s conflicts with an ignored path on the other side; reconcile the path types or .gitignore rules first", entry.Path)
+				}
+			}
+		}
 	}
 	if direction == "import" {
 		return local, remote, nil
