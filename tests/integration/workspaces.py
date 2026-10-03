@@ -325,6 +325,38 @@ def main():
             call([str(binary), 'source', 'apply', '--config', str(config), '--plan', str(import_plan)], env=env)
             assert remote('cat', f'{VM_ROOT}/a/api/code.txt') == 'local-source-must-stay'
             print('PASS source import/export preview + apply; changed source/destination block stale plans', flush=True)
+
+            # Rules from the sender also protect receiver-only runtime files.
+            # Exercise the shared-rule stdin protocol through real SSH + rsync.
+            (local_source / '.gitignore').write_text('runtime/\n*.log\n!keep.log\n')
+            (local_source / 'keep.log').write_text('include this log')
+            (local_source / 'ignored.log').write_text('sender generated log')
+            remote('mkdir', '-p', f'{VM_ROOT}/a/api/runtime')
+            remote('sh', '-c', f"printf 'receiver runtime' > {VM_ROOT}/a/api/runtime/local.txt")
+            remote('ln', '-s', 'missing-target', f'{VM_ROOT}/a/api/runtime/broken')
+            ignored_import = temporary / 'gitignore-import.json'
+            preview = call([str(binary), 'source', 'import', '--config', str(config), '--path', 'a/api',
+                            '--delete', '--plan', str(ignored_import)], env=env)
+            assert 'runtime/' not in preview and 'ignored.log' not in preview, preview
+            call([str(binary), 'source', 'apply', '--config', str(config), '--plan', str(ignored_import)], env=env)
+            assert remote('cat', f'{VM_ROOT}/a/api/keep.log') == 'include this log'
+            assert remote('cat', f'{VM_ROOT}/a/api/runtime/local.txt') == 'receiver runtime'
+            remote('test', '-L', f'{VM_ROOT}/a/api/runtime/broken')
+            remote('test', '!', '-e', f'{VM_ROOT}/a/api/ignored.log')
+
+            (local_source / 'runtime').mkdir()
+            (local_source / 'runtime/local.txt').write_text('local receiver runtime')
+            (local_source / 'stale.txt').write_text('delete this source file')
+            remote('sh', '-c', f"printf 'remote code' > {VM_ROOT}/a/api/code.txt")
+            ignored_export = temporary / 'gitignore-export.json'
+            call([str(binary), 'source', 'export', '--config', str(config), '--path', 'a/api',
+                  '--delete', '--plan', str(ignored_export)], env=env)
+            call([str(binary), 'source', 'apply', '--config', str(config), '--plan', str(ignored_export)], env=env)
+            assert (local_source / 'code.txt').read_text() == 'remote code'
+            assert (local_source / 'runtime/local.txt').read_text() == 'local receiver runtime'
+            assert (local_source / 'ignored.log').read_text() == 'sender generated log'
+            assert not (local_source / 'stale.txt').exists()
+            print('PASS automatic .gitignore over SSH in both directions; negation + receiver-only runtime survive --delete', flush=True)
             print('ALL WORKSPACE E2E CHECKS PASSED', flush=True)
         finally:
             if config.exists():
