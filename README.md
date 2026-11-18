@@ -99,11 +99,43 @@ Host dev-vm
     User developer
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
+    ServerAliveInterval 20
+    ServerAliveCountMax 3
 ```
 
-Сначала проверь `ssh dev-vm` и ключ сервера. Ключ должен быть доступен для
+Если ВМ доступна через промежуточный SSH-сервер, добавь отдельный алиас для
+этого сервера и укажи его в `ProxyJump` целевого хоста:
+
+```sshconfig
+Host dev-jump
+    HostName 192.0.2.10
+    User developer
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    BatchMode yes
+
+Host dev-vm
+    HostName 198.51.100.20
+    User developer
+    ProxyJump dev-jump
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    ServerAliveInterval 20
+    ServerAliveCountMax 3
+```
+
+Адреса в примере зарезервированы для документации. Замени их, пользователей и
+пути к ключам своими. `workspace.host` остаётся `dev-vm`. Сначала проверь
+ключи обоих серверов и доступ через `ssh dev-vm`. Ключи должны быть доступны для
 подключений без ввода пароля, например через ssh-agent/keychain.
-Stealth Box не отключает проверку ключа сервера и не включает agent forwarding.
+Stealth Box не отключает проверку ключей серверов и не включает agent forwarding.
+
+Интерактивное подключение и обратный туннель берут настройки keepalive из OpenSSH.
+Чтобы сохранить прежний интервал после обновления, укажи для целевого хоста
+`ServerAliveInterval 15` и `ServerAliveCountMax 3`. Без настройки интервала
+действуют значения OpenSSH. Если используешь `STEALTHBOX_SSH_CONFIG` с `ProxyJump`,
+выбери путь без пробелов и специальных символов оболочки. OpenSSH передаёт этот
+путь дочернему процессу для подключения к промежуточному серверу.
 
 ### 3. Один конфиг, одна команда
 
@@ -117,6 +149,15 @@ Stealth Box не отключает проверку ключа сервера �
     "runner": "local"
   }
 }
+```
+
+Для управляемой tmux-сессии с именем `work` добавь `"name": "work"`
+в объект `workspace` и запусти `stealthbox connect --agent shell`.
+Stealth Box использует свой сервер tmux (`tmux -L stealthbox`). Существующую сессию
+`work` на стандартном сервере tmux можно открыть через тот же SSH-алиас:
+
+```sh
+ssh -t dev-vm 'tmux new-session -A -s work'
 ```
 
 `local` — Docker на твоём компьютере; `vm` — прогоны на ВМ. Этот параметр задаёт

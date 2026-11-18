@@ -106,7 +106,7 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 			argv = append(argv, o.Extra...)
 		}
 		cmd := sshCommand(c.Workspace.Host, shellArgs(argv), true)
-		options := []string{"-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes"}
+		options := []string{"-o", "ExitOnForwardFailure=yes"}
 		for _, f := range c.Workspace.Forwards {
 			options = append(options, "-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", f.Local, f.Remote))
 		}

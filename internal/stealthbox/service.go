@@ -198,7 +198,7 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 		}
 		cmd := sshCommand(c.Workspace.Host, "", false)
 		cmd.Args = cmd.Args[:len(cmd.Args)-1]
-		cmd.Args = append([]string{"-N", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
+		cmd.Args = append([]string{"-N", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
 		fmt.Fprintln(log, "Connecting Mac bridge to", c.Workspace.Host)
 		err = ExecuteContext(ctx, cmd, nil, io.Discard, log)
 		if ctx.Err() != nil {

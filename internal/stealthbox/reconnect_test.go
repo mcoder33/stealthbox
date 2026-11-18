@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -96,6 +97,50 @@ func TestReadyCreatesChangedRootWithoutRestartingPanes(t *testing.T) {
 				t.Fatal("retained agent was restarted", before, after)
 			}
 		})
+	}
+}
+
+func TestConnectHonorsSSHHostOptions(t *testing.T) {
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("OpenSSH client unavailable")
+	}
+	c := reconnectFixture(t)
+	c.Bridge.Enabled = false
+	t.Setenv("TMUX", "")
+	dir := canonicalTemp(t)
+	sshConfig := filepath.Join(dir, "ssh_config")
+	if err := os.WriteFile(sshConfig, []byte(`Host fixture-vm
+	HostName 192.0.2.10
+	ProxyJump fixture-jump
+	ServerAliveInterval 20
+	ServerAliveCountMax 4
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STEALTHBOX_SSH_CONFIG", sshConfig)
+	shim := filepath.Join(localDeploymentSSH(t), "ssh")
+	script := "#!/bin/sh\n" + `for arg do
+	case "$arg" in -t) exec ` + Quote(ssh) + ` -G "$@";; esac
+done
+while [ "$#" -gt 1 ]; do shift; done
+exec /bin/sh -c "$1"
+`
+	if err := os.WriteFile(shim, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var output, stderr bytes.Buffer
+	config := filepath.Join(dir, "local.json")
+	if err := Connect(ctx, &c, config, ConnectOptions{}, &output, &stderr); err != nil {
+		t.Fatalf("connect: %v\n%s", err, &stderr)
+	}
+	for _, option := range []string{"proxyjump fixture-jump", "serveraliveinterval 20", "serveralivecountmax 4", "exitonforwardfailure yes"} {
+		if !strings.Contains("\n"+output.String()+"\n", "\n"+option+"\n") {
+			t.Errorf("effective SSH configuration is missing %q", option)
+		}
 	}
 }
 
