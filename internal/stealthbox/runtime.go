@@ -132,11 +132,17 @@ func Output(ctx context.Context, cmd Command) ([]byte, error) {
 	return out, err
 }
 func Guide(project, runner string) string {
+	workloadGuide := " Run Docker, builds, test suites, dependency installation, full lint, and other heavy workloads only through the stealthbox runner_run MCP tool using the configured runner. " +
+		"Omit runner to use the session default. A local runner executes on the Mac in a separate checkout. " +
+		"If the configured runner is unavailable, report the blocker. Do not fall back to shell commands or switch to the VM. " +
+		"Do not automatically retry a command after disconnection without checking whether it ran."
+	imageGuide := " View Mac terminal clipboard paths supplied by the user only through the stealthbox " +
+		readPastedImageTool + " MCP tool. Pass the exact absolute pasted-image-*.png path. If the bridge or file is unavailable, ask the user to paste or upload the image again."
 	if project == "" {
-		return fmt.Sprintf(`Stealth Box workspace scope, default runner=%s. One agent may work across repositories under the configured VM workspace root. Before editing or testing each repository, read its AGENTS.md and applicable parent/child instructions; switching repositories does not load those instructions automatically. Call projects_list to discover relative checkout paths. Every runner_run, vm_exec or mac_exec call must identify its checkout using path; never guess from a repeated basename. Run tests with runner_run; runner=local synchronizes only that checkout to a separate local runner and runner=vm executes on the VM. cwd is relative to the selected checkout. Git worktrees and same-named repositories have separate runner directories. Source changes remain on the VM; the local runner never overwrites the user's local source checkout. Commands execute with the selected user's permissions, not in a security sandbox. Do not retry after a disconnected result without checking whether it ran.`, runner)
+		return fmt.Sprintf(`Stealth Box workspace scope, default runner=%s. One agent may work across repositories under the configured VM workspace root. Before editing or testing each repository, read its AGENTS.md and applicable parent/child instructions; switching repositories does not load those instructions automatically. Call projects_list to discover relative checkout paths. Every runner_run, vm_exec or mac_exec call must identify its checkout using path; never guess from a repeated basename. cwd is relative to the selected checkout. Git worktrees and same-named repositories have separate runner directories. Source changes remain on the VM; the local runner never overwrites the user's local source checkout. Commands execute with the selected user's permissions, not in a security sandbox.`, runner) + workloadGuide + imageGuide
 	}
 	return fmt.Sprintf(`Stealth Box environment: project=%s, default runner=%s.
-The agent and authoritative source code live on the VM. Use the stealthbox runner_run MCP tool (or "stealthbox run -- COMMAND ARGS") for Docker/test commands so the configured runner is honored. The Mac runner synchronizes uncommitted VM files into a disposable Mac checkout, executes there and returns output. Volumes and databases are not moved. Use mac_exec for explicit Mac tasks only when that tool is enabled. Mac commands execute with the Mac user's permissions, not in a security sandbox. Use vm_exec for explicit VM commands. Do not automatically retry a command after a disconnected result; verify whether it ran first.`, project, runner)
+The agent and authoritative source code live on the VM. The Mac runner synchronizes uncommitted VM files into a disposable Mac checkout, executes there and returns output. Volumes and databases are not moved. Use mac_exec for explicit Mac tasks only when that tool is enabled. Mac commands execute with the Mac user's permissions, not in a security sandbox. Use vm_exec for explicit VM commands outside the runner workloads described below.`, project, runner) + workloadGuide + imageGuide
 }
 func AgentCommand(c Config, configPath, project, agent, runner string, extra []string) ([]string, error) {
 	args, ok := c.Agents[agent]
@@ -159,10 +165,8 @@ func AgentCommand(c Config, configPath, project, agent, runner string, extra []s
 		return nil, err
 	}
 	if agent == "codex" {
-		args = append(args, "-c", "mcp_servers.stealthbox.command="+JSONString(bin), "-c", "mcp_servers.stealthbox.args="+JSONString([]string{"mcp", "--config", configPath}), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_PROJECT="+JSONString(project), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_RUNNER="+JSONString(runner))
-	}
-	if agent == "codex" {
-		args = append(args, "-c", "mcp_servers.stealthbox.env.STEALTHBOX_SCOPE="+JSONString(agentScope(c, project)))
+		args = append(args, "-c", "mcp_servers.stealthbox.command="+JSONString(bin), "-c", "mcp_servers.stealthbox.args="+JSONString([]string{"mcp", "--config", configPath}), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_PROJECT="+JSONString(project), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_RUNNER="+JSONString(runner),
+			"-c", "mcp_servers.stealthbox.env.STEALTHBOX_SCOPE="+JSONString(agentScope(c, project)))
 	}
 	if agent == "claude" {
 		args = append(args, "--append-system-prompt", Guide(project, runner), "--mcp-config", JSONString(map[string]any{"mcpServers": map[string]any{"stealthbox": map[string]any{"command": bin, "args": []string{"mcp", "--config", configPath}, "env": map[string]string{"STEALTHBOX_PROJECT": project, "STEALTHBOX_RUNNER": runner, "STEALTHBOX_SCOPE": agentScope(c, project)}}}}))

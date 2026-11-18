@@ -81,6 +81,10 @@ func BridgeHandler(c Config) http.Handler {
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "allow_exec": c.Bridge.AllowExec, "config_hash": configHash(c)})
 			return
 		}
+		if r.URL.Path == pastedImageEndpoint && r.Method == http.MethodGet {
+			servePastedImage(w, r)
+			return
+		}
 		if r.URL.Path == "/file" && r.Method == "GET" {
 			serveFile(w, r, c, locks)
 			return
@@ -300,7 +304,8 @@ func serveManagedBridge(ctx context.Context, c Config, ready chan<- struct{}, st
 			stop()
 			return
 		}
-		if r.URL.Path == "/run" && r.Method == "POST" || r.URL.Path == "/file" && r.Method == "GET" {
+		if r.URL.Path == "/run" && r.Method == http.MethodPost ||
+			(r.URL.Path == "/file" || r.URL.Path == pastedImageEndpoint) && r.Method == http.MethodGet {
 			activity.Lock()
 			if draining {
 				activity.Unlock()

@@ -71,9 +71,12 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 			result = map[string]any{}
 		case "tools/list":
 			schema := map[string]any{"type": "object", "properties": map[string]any{"argv": map[string]any{"type": "array", "items": map[string]string{"type": "string"}, "minItems": 1}, "project": map[string]string{"type": "string", "description": "Legacy configured project name"}, "path": map[string]string{"type": "string", "description": "Workspace checkout path, absolute under VMRoot or relative to VMRoot; required per workspace call"}, "runner": map[string]any{"type": "string", "enum": []string{"vm", "local", "mac"}}, "cwd": map[string]string{"type": "string", "description": "Command directory relative to the selected checkout; selecting a subdirectory path syncs the whole checkout"}}, "required": []string{"argv"}, "additionalProperties": false}
-			tools := []map[string]any{{"name": "runner_run", "description": "Run Docker/test commands on the selected VM or local runner. Local runs synchronize uncommitted checkout files using the configured transport, preserve dependency caches, and return stdout/stderr/exit status. Do not retry automatically after disconnection.", "inputSchema": schema}, {"name": "vm_exec", "description": "Execute an explicit command in the selected source checkout on the VM without synchronization.", "inputSchema": schema}}
+			tools := []map[string]any{{"name": "runner_run", "description": "The required tool for Docker, builds, test suites, dependency installation, full lint, and other heavy workloads. Omit runner to use the configured runner. If unavailable, report the blocker without a shell or VM fallback. Local runs synchronize uncommitted files, preserve dependency caches, and return stdout/stderr/exit status. Do not retry automatically after disconnection.", "inputSchema": schema}, {"name": "vm_exec", "description": "Execute an explicit command in the selected source checkout on the VM without synchronization. Use runner_run for heavy workloads.", "inputSchema": schema}}
 			if workspaceMCPScope(c) {
 				tools = append(tools, map[string]any{"name": "projects_list", "description": "Discover Git checkouts and worktrees under the configured VM workspace root. Each execution must supply its own path; repeated basenames are not identities.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}})
+			}
+			if c.Bridge.Enabled {
+				tools = append(tools, pastedImageToolDefinition())
 			}
 			if c.Bridge.Enabled && c.Bridge.AllowExec {
 				for _, name := range []string{"local_exec", "mac_exec"} {
@@ -83,16 +86,27 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 			result = map[string]any{"tools": tools}
 		case "tools/call":
 			var p struct {
-				Name      string `json:"name"`
-				Arguments struct {
-					Argv    []string `json:"argv"`
-					Project string   `json:"project"`
-					Path    string   `json:"path"`
-					Runner  string   `json:"runner"`
-					CWD     string   `json:"cwd"`
-				} `json:"arguments"`
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
 			}
 			err := json.Unmarshal(req.Params, &p)
+			if err == nil && p.Name == readPastedImageTool {
+				result, err = callPastedImageTool(ctx, c, p.Arguments)
+				if err != nil {
+					result = map[string]any{"content": []map[string]string{{"type": "text", "text": err.Error()}}, "isError": true}
+				}
+				break
+			}
+			var arguments struct {
+				Argv    []string `json:"argv"`
+				Project string   `json:"project"`
+				Path    string   `json:"path"`
+				Runner  string   `json:"runner"`
+				CWD     string   `json:"cwd"`
+			}
+			if err == nil && len(p.Arguments) > 0 {
+				err = json.Unmarshal(p.Arguments, &arguments)
+			}
 			stdout := &cappedBuffer{limit: 1 << 20}
 			stderr := &cappedBuffer{limit: 1 << 20}
 			if err == nil {
@@ -108,12 +122,12 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 						}
 					}
 				} else {
-					selector := p.Arguments.Project
-					if p.Arguments.Path != "" {
+					selector := arguments.Project
+					if arguments.Path != "" {
 						if selector != "" {
 							err = fmt.Errorf("choose either project or path, not both")
 						} else {
-							selector, err = WorkspaceCheckoutPath(c, p.Arguments.Path)
+							selector, err = WorkspaceCheckoutPath(c, arguments.Path)
 						}
 					}
 					if workspaceMCPScope(c) {
@@ -125,11 +139,11 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 						if selector == "" {
 							selector = bound
 						}
-						if p.Arguments.Path != "" || (bound != "" && selector != bound) {
+						if arguments.Path != "" || (bound != "" && selector != bound) {
 							err = fmt.Errorf("this agent's tools are bound to project %s", bound)
 						}
 					}
-					runner := p.Arguments.Runner
+					runner := arguments.Runner
 					if runner == "" {
 						runner = envOr("STEALTHBOX_RUNNER", "vm")
 					}
@@ -151,7 +165,7 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 					if err == nil {
 						_, timeout := limits(c)
 						callCtx, cancel := context.WithTimeout(ctx, timeout)
-						err = Run(callCtx, c, selector, runner, p.Arguments.Argv, snapshot, p.Arguments.CWD, stdout, stderr)
+						err = Run(callCtx, c, selector, runner, arguments.Argv, snapshot, arguments.CWD, stdout, stderr)
 						cancel()
 					}
 				}
