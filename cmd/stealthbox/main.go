@@ -159,7 +159,7 @@ func run(ctx context.Context, args []string) error {
 		if visited["shell-integration"] {
 			c.Workspace.ShellIntegration = *shellIntegration
 		}
-		if visited["runner"] && (args[0] == "init" || args[0] == "config") {
+		if visited["runner"] && (args[0] == "init" || args[0] == "config" || args[0] == "setup" && visited["host"]) {
 			c.Workspace.Runner = *runner
 		}
 		if oldHost != c.Workspace.Host || oldRoot != c.Workspace.VMRoot {
@@ -167,31 +167,27 @@ func run(ctx context.Context, args []string) error {
 		}
 		return stealthbox.NormalizeLocalWorkspaceRoots(c)
 	}
+	newProfile := func() (stealthbox.Config, error) {
+		return newWorkspaceProfile(*config, *host, *vmRoot, visited["vm-root"], *enableMac, *allowExec, applyWorkspaceFlags)
+	}
 	switch args[0] {
 	case "init":
+		c, e := newProfile()
+		if e != nil {
+			return e
+		}
 		if *dry {
 			fmt.Println("Would create", *config)
 			return nil
 		}
-		if _, e := os.Stat(*config); !os.IsNotExist(e) {
-			return fmt.Errorf("config already exists or is inaccessible")
-		}
-		c, e := stealthbox.DefaultConfig()
-		if e != nil {
-			return e
-		}
-		if !visited["vm-root"] {
-			c.Workspace.VMRoot = "~/Projects"
-		}
-		if e = applyWorkspaceFlags(&c); e != nil {
-			return e
-		}
-		c.Bridge.Enabled = c.Bridge.Enabled || *enableMac
-		c.Bridge.AllowExec = *allowExec
-		if err = stealthbox.Save(*config, c); err == nil {
+		if err = stealthbox.CreateConfig(*config, c); err == nil {
 			fmt.Println("Created", *config, "(mode 0600). Run stealthbox to prepare and open your tmux workspace.")
 		}
 		return err
+	case "setup":
+		if visited["host"] {
+			return setupFromAlias(ctx, *config, *host, *binary, *dry, newProfile, applyWorkspaceFlags)
+		}
 	case "tui", "settings":
 		if *dry {
 			return fmt.Errorf("--dry-run is not used with TUI")
@@ -201,7 +197,7 @@ func run(ctx context.Context, args []string) error {
 	c, err := stealthbox.Load(*config)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("configuration not found: %s; create it once with stealthbox init --host YOUR_SSH_ALIAS", *config)
+			return fmt.Errorf("configuration not found: %s; run stealthbox setup --host YOUR_SSH_ALIAS first", *config)
 		}
 		return err
 	}
@@ -303,6 +299,15 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.Setup(ctx, &c, *config, *binary, os.Stdout)
+	case "auth-status":
+		if visited["host"] || len(f.Args()) != 0 {
+			return fmt.Errorf("use auth-status [--config PATH] [--agent codex|claude] with the saved VM alias")
+		}
+		if *dry {
+			fmt.Printf("Would check native agent sign-in status on %s.\n", c.Workspace.Host)
+			return nil
+		}
+		return stealthbox.AgentAuthStatus(ctx, c.Workspace.Host, *agent, os.Stdout)
 	case "theme-apply":
 		if *dry {
 			return nil
@@ -553,7 +558,11 @@ func usage() {
   stealthbox init --host dev-vm [--runner local|vm] [--allow-mac-exec]
   stealthbox config --vm-root '~/Projects' --local-root ~/Projects --runner-root ~/.local/share/stealthbox/runners --shell-integration
   stealthbox project --project NAME --path /home/user/project --mac-path /Users/user/runner
-  stealthbox setup [--binary PATH]    Prepare VM tools, Codex, Claude, binary, terminal and style
+  stealthbox setup --host dev-vm [--runner local|vm] [--binary PATH]
+                                      Create or resume a profile and prepare the VM
+  stealthbox setup [--binary PATH]    Refresh an existing VM installation
+  stealthbox auth-status [--agent codex|claude]
+                                      Check native agent sign-in status on the saved VM
   stealthbox theme                    Export current local tmux options/key bindings
   stealthbox connect --project NAME --agent codex --runner mac [--slot main]
   stealthbox connect                 Same as bare stealthbox: resume the active workspace window

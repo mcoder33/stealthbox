@@ -166,6 +166,15 @@ func (c Config) Validate() error {
 	return nil
 }
 func Save(path string, c Config) error {
+	return saveConfig(path, c, false)
+}
+
+// CreateConfig publishes a complete profile only if its destination is absent.
+func CreateConfig(path string, c Config) error {
+	return saveConfig(path, c, true)
+}
+
+func saveConfig(path string, c Config, create bool) error {
 	if err := EnsureWorkspaceIdentity(&c); err != nil {
 		return err
 	}
@@ -202,6 +211,9 @@ func Save(path string, c Config) error {
 	}
 	if err = f.Close(); err != nil {
 		return err
+	}
+	if create {
+		return os.Link(f.Name(), path)
 	}
 	return os.Rename(f.Name(), path)
 }

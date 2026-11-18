@@ -218,7 +218,8 @@ func releaseBinary(ctx context.Context, goos, arch string) (string, func(), erro
 
 // Setup prepares the workspace and its two standard agents. User credentials
 // and source working copies are never implicitly copied or overwritten.
-func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.Writer) error {
+func Setup(ctx context.Context, c *Config, configPath, binary string, stdout io.Writer) (resultErr error) {
+	defer discardUnrecordedTheme(c, c.Workspace.Theme, &resultErr)
 	goos, arch, err := resolveRemote(ctx, c)
 	if err != nil {
 		return err

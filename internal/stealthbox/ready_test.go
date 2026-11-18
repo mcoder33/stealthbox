@@ -217,3 +217,33 @@ func TestThemeSnapshotPreservesPaletteAndOmitsGeneratedLayout(t *testing.T) {
 		t.Fatal("explicit custom status layout was lost", err)
 	}
 }
+
+func TestAutomaticThemePreservesNeighboringFiles(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", root)
+	config := filepath.Join(root, "custom.json")
+	for _, file := range []string{"tmux.conf", "custom.json.tmux.conf"} {
+		if err := os.WriteFile(filepath.Join(root, file), []byte("unrelated theme"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := Config{Workspace: WorkspaceConfig{VMRoot: "~/Projects"}}
+	if err := prepareWorkspaceTheme(context.Background(), &c, config, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{"tmux.conf", "custom.json.tmux.conf"} {
+		if data, err := os.ReadFile(filepath.Join(root, file)); err != nil || string(data) != "unrelated theme" {
+			t.Fatalf("automatic preparation changed %s: %v", file, err)
+		}
+	}
+	path := c.Workspace.Theme
+	if filepath.Dir(path) != root {
+		t.Fatalf("generated theme must be beside this profile: %q", path)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != defaultTheme {
+		t.Fatalf("generated built-in theme missing: %v", err)
+	}
+	if err := prepareWorkspaceTheme(context.Background(), &c, config, io.Discard); err != nil || c.Workspace.Theme != path {
+		t.Fatalf("rerun did not reuse the recorded theme path: %q, %v", c.Workspace.Theme, err)
+	}
+}

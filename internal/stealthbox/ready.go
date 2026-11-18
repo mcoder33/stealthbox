@@ -3,6 +3,7 @@ package stealthbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -66,12 +67,12 @@ trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
 if ! command -v codex >/dev/null 2>&1; then
     printf 'Installing Codex from OpenAI…\n'
     curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --connect-timeout 20 --max-time 180 https://chatgpt.com/codex/install.sh -o "$task_tmp/codex-install.sh"
-    sh "$task_tmp/codex-install.sh"
+    sh "$task_tmp/codex-install.sh" </dev/null
 fi
 if ! command -v claude >/dev/null 2>&1; then
     printf 'Installing Claude Code from Anthropic…\n'
     curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --connect-timeout 20 --max-time 180 https://claude.ai/install.sh -o "$task_tmp/claude-install.sh"
-    bash "$task_tmp/claude-install.sh"
+    bash "$task_tmp/claude-install.sh" </dev/null
 fi
 for tool in tmux git rsync codex claude; do
     command -v "$tool" >/dev/null 2>&1 || { printf 'Preparation did not provide %s in PATH\n' "$tool" >&2; exit 1; }
@@ -85,7 +86,9 @@ func prepareRemoteTools(ctx context.Context, c Config, stdout io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	if err := ExecuteContext(ctx, sshCommand(c.Workspace.Host, "sh -s", false), strings.NewReader(prepareToolsScript), stdout, stdout); err != nil {
+	cmd := sshCommand(c.Workspace.Host, "sh -s", false)
+	cmd.Args = append([]string{"-T"}, cmd.Args...)
+	if err := ExecuteNoninteractiveContext(ctx, cmd, strings.NewReader(prepareToolsScript), stdout, stdout); err != nil {
 		return fmt.Errorf("prepare VM tools (rerun after resolving the error above): %w", err)
 	}
 	return nil
@@ -104,7 +107,8 @@ func checkRemoteTools(ctx context.Context, c Config) error {
 
 // EnsureReady also upgrades old installations reached through settings/bridge
 // actions, not only the main connect command.
-func EnsureReady(ctx context.Context, c *Config, path, binary string, w io.Writer) error {
+func EnsureReady(ctx context.Context, c *Config, path, binary string, w io.Writer) (resultErr error) {
+	defer discardUnrecordedTheme(c, c.Workspace.Theme, &resultErr)
 	if _, _, err := resolveRemote(ctx, c); err != nil {
 		return err
 	}
@@ -186,12 +190,29 @@ func prepareWorkspaceTheme(ctx context.Context, c *Config, configPath string, w 
 		theme = []byte(defaultTheme)
 		fmt.Fprintln(w, "Local tmux is unavailable; using the built-in theme. Import your style later with stealthbox theme.")
 	}
-	path := filepath.Join(filepath.Dir(configPath), "tmux.conf")
-	if err = writePrivate(path, theme); err != nil {
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	c.Workspace.Theme = path
+	file, err := os.CreateTemp(dir, filepath.Base(configPath)+".tmux-*.conf")
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(theme)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		_ = os.Remove(file.Name())
+		return err
+	}
+	c.Workspace.Theme = file.Name()
 	return nil
+}
+
+// A generated theme becomes profile state only after the caller saves it.
+func discardUnrecordedTheme(c *Config, previous string, resultErr *error) {
+	if *resultErr != nil && previous == "" && c.Workspace.Theme != "" {
+		_ = os.Remove(c.Workspace.Theme)
+		c.Workspace.Theme = ""
+	}
 }
 
 func writePrivate(path string, data []byte) error {
