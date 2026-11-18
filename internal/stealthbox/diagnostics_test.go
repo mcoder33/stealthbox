@@ -25,7 +25,9 @@ case "$1" in
  dead|dead-alias) printf 'fixture transport failure\n' >&2; exit 255;;
  blocked) sleep 5 & wait; exit 0;;
 esac
-case "$2" in *'command -v tmux'*) printf 'tmux missing\n' >&2; exit 127;; esac
+case "$2" in
+  *'bridge-health'*) [ "$1" != no-forward ] || exit 1;;
+  *'command -v tmux'*) printf 'tmux missing\n' >&2; exit 127;; esac
 exit 0
 `
 	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(program), 0700); err != nil {
@@ -199,5 +201,93 @@ func TestBridgeStatusDistinguishesReadOnlyFixtureStates(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRemoteBridgeProbeChecksTransportAndEndpoint(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", root)
+	ssh := `#!/bin/sh
+test "$1" = -T || exit 20
+while [ "$#" -gt 2 ]; do shift; done
+case "$2" in
+  "'/fixture/state/bin/stealthbox' 'bridge-health' '--config' '/fixture/state/config.json'") ;;
+  *) exit 21 ;;
+esac
+case "$1" in
+  ready) exit 0 ;;
+  cold) /bin/sleep 2.3; exit 0 ;;
+  denied) exit 255 ;;
+  no-forward) exit 1 ;;
+  stalled) /bin/sleep 5 & wait ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(root, "ssh"), []byte(ssh), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c := Config{Workspace: WorkspaceConfig{RemoteDir: "/fixture/state"}}
+	for _, tc := range []struct {
+		host, message string
+		timeout       time.Duration
+	}{
+		{"ready", "", 2 * time.Second},
+		{"cold", "", 5 * time.Second},
+		{"denied", "SSH", 2 * time.Second},
+		{"no-forward", "Mac bridge", 2 * time.Second},
+		{"stalled", "deadline exceeded", 300 * time.Millisecond},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			c.Workspace.Host = tc.host
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			defer cancel()
+			started := time.Now()
+			err := CheckRemoteBridge(ctx, c)
+			if tc.message == "" && err != nil || tc.message != "" && (err == nil || !strings.Contains(err.Error(), tc.message)) {
+				t.Fatalf("probe returned %v; expected %q", err, tc.message)
+			}
+			if elapsed := time.Since(started); elapsed > tc.timeout+time.Second {
+				t.Fatalf("probe left an SSH process or descendant running: %s", elapsed)
+			}
+		})
+	}
+}
+
+func TestDoctorReportsUnreachableReverseBridgeWithHealthyLocalSocket(t *testing.T) {
+	log := doctorSSHFixture(t)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(log), "docker"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp("/tmp", "sb-doctor-bridge-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	c := bridgeConfig(t)
+	c.Bridge.Socket = filepath.Join(root, "bridge.sock")
+	c.Workspace.Host = "no-forward"
+	c.Workspace.RemoteDir = "/fixture/state"
+	listener, err := net.Listen("unix", c.Bridge.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/health" || r.Header.Get("Authorization") != "Bearer "+c.Bridge.Token {
+			t.Error("unexpected bridge probe")
+			w.WriteHeader(401)
+			return
+		}
+		w.WriteHeader(200)
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+	var output bytes.Buffer
+	if err := Doctor(context.Background(), c, &output); err == nil ||
+		!strings.Contains(output.String(), " OK  Mac bridge") ||
+		!strings.Contains(output.String(), "FAIL VM-to-Mac bridge") {
+		t.Fatalf("doctor must identify a broken reverse bridge: %v\n%s", err, output.String())
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil || strings.Count(string(calls), "'bridge-health'") != 1 {
+		t.Fatalf("doctor did not probe the remote endpoint once: %s, %v", calls, err)
 	}
 }

@@ -56,26 +56,30 @@ func profileBridgeSocket(path, defaultSocket string) (string, error) {
 	return filepath.Join(dir, name[:width]), nil
 }
 
-func setupFromAlias(ctx context.Context, path, host, binary string, dry bool, newProfile func() (stealthbox.Config, error), apply func(*stealthbox.Config) error) error {
+func setupProfile(path, host string, newProfile func() (stealthbox.Config, error), apply func(*stealthbox.Config) error) (stealthbox.Config, bool, error) {
 	if host == "" {
-		return fmt.Errorf("provide your SSH alias with --host")
+		return stealthbox.Config{}, false, fmt.Errorf("provide your SSH alias with --host")
 	}
 	c, err := stealthbox.Load(path)
-	firstSetup := os.IsNotExist(err)
-	switch {
-	case firstSetup:
+	if os.IsNotExist(err) {
 		c, err = newProfile()
-	case err != nil:
-		return err
-	case c.Workspace.Host != host:
-		return fmt.Errorf("profile %s already uses SSH alias %q; choose another --config path", path, c.Workspace.Host)
-	default:
-		err = apply(&c)
+		return c, true, err
 	}
 	if err != nil {
-		return err
+		return c, false, err
 	}
-	if err := c.Validate(); err != nil {
+	if c.Workspace.Host != host {
+		return c, false, fmt.Errorf("profile %s already uses SSH alias %q; choose another --config path", path, c.Workspace.Host)
+	}
+	if err := apply(&c); err != nil {
+		return c, false, err
+	}
+	return c, false, c.Validate()
+}
+
+func setupFromAlias(ctx context.Context, path, host, binary string, dry bool, newProfile func() (stealthbox.Config, error), apply func(*stealthbox.Config) error) error {
+	c, firstSetup, err := setupProfile(path, host, newProfile, apply)
+	if err != nil {
 		return err
 	}
 	if dry {
@@ -99,7 +103,7 @@ func setupFromAlias(ctx context.Context, path, host, binary string, dry bool, ne
 	profileFlag := " --config " + stealthbox.Quote(path)
 	fmt.Printf("VM prepared. Check agent sign-in:\n  stealthbox auth-status%s\nOpen the workspace in your terminal:\n  stealthbox%s\n", profileFlag, profileFlag)
 	if c.Bridge.Enabled {
-		fmt.Printf("Opening the workspace starts the local runner bridge. For a headless check:\n  stealthbox bridge-start%s\n  stealthbox bridge-health%s\n", profileFlag, profileFlag)
+		fmt.Printf("Opening the workspace starts the local runner bridge. For a headless check:\n  stealthbox bridge-start%s\n  stealthbox doctor%s\n", profileFlag, profileFlag)
 	}
 	return nil
 }

@@ -211,21 +211,44 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 		delay = backoff(delay)
 	}
 }
-func WaitRemoteBridge(ctx context.Context, c Config) error {
+
+// CheckRemoteBridge asks the VM's installed CLI to verify its forwarded socket.
+func CheckRemoteBridge(ctx context.Context, c Config) error {
+	if c.Workspace.Host == "" || c.Workspace.RemoteDir == "" {
+		return fmt.Errorf("run setup to configure the VM before checking its bridge")
+	}
 	bin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
 	cfg := filepath.Join(c.Workspace.RemoteDir, "config.json")
-	for i := 0; i < 60; i++ {
-		probe, done := context.WithTimeout(ctx, 2*time.Second)
-		_, e := Output(probe, sshCommand(c.Workspace.Host, shellArgs([]string{bin, "bridge-health", "--config", cfg}), false))
-		done()
-		if e == nil {
+	cmd := sshWithoutTTY(c.Workspace.Host, shellArgs([]string{bin, "bridge-health", "--config", cfg}))
+	err := ExecuteNoninteractiveContext(ctx, cmd, nil, io.Discard, io.Discard)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 255 {
+		return fmt.Errorf("SSH connection to %s failed: %w", c.Workspace.Host, err)
+	}
+	if err != nil {
+		return fmt.Errorf("VM %s could not reach the Mac bridge: %w", c.Workspace.Host, err)
+	}
+	return nil
+}
+
+func WaitRemoteBridge(ctx context.Context, c Config) error {
+	wait, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	for {
+		err := CheckRemoteBridge(wait, c)
+		if err == nil {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-wait.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("VM-to-Mac bridge not verified: %w; see %s.log", err, c.Bridge.Socket)
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("reverse SSH bridge did not become ready; see %s.log", c.Bridge.Socket)
 }

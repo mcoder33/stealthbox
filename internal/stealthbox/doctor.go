@@ -114,7 +114,10 @@ func Doctor(ctx context.Context, c Config, w io.Writer) error {
 		})
 	}
 	if c.Bridge.Enabled {
-		check("Mac bridge (connect or bridge must be running)", func(ctx context.Context) error { return BridgeHealth(ctx, c) })
+		localBridgeReady := check("Mac bridge (connect or bridge must be running)", func(ctx context.Context) error { return BridgeHealth(ctx, c) })
+		if localBridgeReady && c.Workspace.Host != "" {
+			remoteCheck("VM-to-Mac bridge", c.Workspace.Host, func(ctx context.Context) error { return CheckRemoteBridge(ctx, c) })
+		}
 	}
 	if failed {
 		return fmt.Errorf("some checks failed; see results above")

@@ -193,29 +193,7 @@ func saveConfig(path string, c Config, create bool) error {
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".config-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err = f.Chmod(0600); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err = f.Write(append(data, '\n')); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if create {
-		return os.Link(f.Name(), path)
-	}
-	return os.Rename(f.Name(), path)
+	return writePrivateFile(path, append(data, '\n'), create)
 }
 func Defaults(p Project, agent, runner string) (string, string) {
 	if agent == "" {

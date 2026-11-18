@@ -25,7 +25,8 @@ func TestAgentAuthStatus(t *testing.T) {
 		{"Claude third party", "claude", "printf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"third_party\"}'; exit 0", "external provider", false},
 		{"Claude changed format", "claude", "printf '%s\\n' 'test-secret'; exit 0", "status unavailable", false},
 		{"Claude access failure", "claude", "printf '%s\\n' '{\"loggedIn\":false,\"authMethod\":\"none\"}'; exit 70", "status unavailable", false},
-		{"missing executable", "codex", "exit 127", "not installed", false},
+		{"native launcher exited 127", "codex", "exit 127", "status unavailable", false},
+		{"missing executable", "codex", "printf %s stealthbox-native-cli-missing; exit 127", "not installed", false},
 		{"SSH refused", "claude", "printf '%s\\n' 'test-secret' >&2; exit 255", "SSH connection failed", false},
 	}
 	for _, tc := range cases {
@@ -45,7 +46,7 @@ func TestAgentAuthStatus(t *testing.T) {
 				t.Fatal(err)
 			}
 			var out bytes.Buffer
-			err := AgentAuthStatus(context.Background(), "fixture-vm", tc.agent, &out)
+			err := AgentAuthStatus(context.Background(), Config{Workspace: WorkspaceConfig{Host: "fixture-vm"}}, tc.agent, &out)
 			if (err == nil) != tc.ready || !strings.Contains(out.String(), tc.agent+": "+tc.status) {
 				t.Fatalf("status %q, err=%v; want %q and ready=%t", out.String(), err, tc.status, tc.ready)
 			}
@@ -53,5 +54,29 @@ func TestAgentAuthStatus(t *testing.T) {
 				t.Fatal("status surfaced raw credential or account data")
 			}
 		})
+	}
+}
+
+func TestAuthStatusSkipsCustomLauncherAndChecksOtherAgent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", root)
+	ssh := "#!/bin/sh\nwhile [ \"$#\" -gt 1 ]; do shift; done\n" +
+		"case \"$1\" in *'exec codex login status') printf 'Logged in using ChatGPT\\n' >&2 ;; *) exit 24 ;; esac\n"
+	if err := os.WriteFile(filepath.Join(root, "ssh"), []byte(ssh), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c := Config{
+		Workspace: WorkspaceConfig{Host: "fixture-vm"},
+		Agents:    map[string][]string{"claude": {"env", "CLAUDE_CONFIG_DIR=test-secret", "claude"}},
+	}
+	var out bytes.Buffer
+	err := AgentAuthStatus(context.Background(), c, "", &out)
+	if err == nil || !strings.Contains(out.String(), "codex: signed in") ||
+		!strings.Contains(out.String(), "claude: status unavailable (custom launcher") ||
+		!strings.Contains(out.String(), "auth status --json") {
+		t.Fatalf("result %q, err=%v; want one verified agent and one unsupported launcher", out.String(), err)
+	}
+	if strings.Contains(out.String(), "test-secret") || strings.Contains(err.Error(), "test-secret") {
+		t.Fatal("status showed custom agent argv")
 	}
 }

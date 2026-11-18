@@ -18,6 +18,12 @@ import (
 )
 
 func sshCommand(host, script string, tty bool) Command { return At(Endpoint{Host: host}, script, tty) }
+func sshWithoutTTY(host, script string) Command {
+	cmd := sshCommand(host, script, false)
+	cmd.Args = append([]string{"-T"}, cmd.Args...)
+	return cmd
+}
+
 func upload(ctx context.Context, host, path string, content io.Reader) error {
 	script := "set -eu; umask 077; mkdir -p " + Quote(filepath.Dir(path)) +
 		"; upload_tmp=$(mktemp " + Quote(path+".tmp.XXXXXX") + "); trap 'rm -f \"$upload_tmp\"' EXIT; trap 'exit 1' HUP INT TERM; cat > \"$upload_tmp\"; mv \"$upload_tmp\" " + Quote(path)

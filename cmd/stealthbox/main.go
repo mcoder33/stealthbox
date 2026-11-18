@@ -307,7 +307,7 @@ func run(ctx context.Context, args []string) error {
 			fmt.Printf("Would check native agent sign-in status on %s.\n", c.Workspace.Host)
 			return nil
 		}
-		return stealthbox.AgentAuthStatus(ctx, c.Workspace.Host, *agent, os.Stdout)
+		return stealthbox.AgentAuthStatus(ctx, c, *agent, os.Stdout)
 	case "theme-apply":
 		if *dry {
 			return nil
@@ -354,7 +354,14 @@ func run(ctx context.Context, args []string) error {
 		if err = stealthbox.EnsureReady(ctx, &c, *config, *binary, os.Stdout); err != nil {
 			return err
 		}
-		return stealthbox.StartBridgeService(ctx, c, *config, os.Stdout)
+		if err := stealthbox.StartBridgeService(ctx, c, *config, os.Stdout); err != nil {
+			return err
+		}
+		if err := stealthbox.WaitRemoteBridge(ctx, c); err != nil {
+			return err
+		}
+		fmt.Println("VM-to-Mac bridge verified.")
+		return nil
 	case "bridge-stop":
 		if *dry {
 			fmt.Println("Would stop Mac bridge")

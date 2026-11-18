@@ -98,3 +98,53 @@ func TestFreshProfilesUseSeparateBridgeSockets(t *testing.T) {
 		sockets[c.Bridge.Socket] = true
 	}
 }
+func TestSetupPreparesAndResumesWithTheSameProfile(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "config.json")
+	log := filepath.Join(root, "ssh.log")
+	binary := filepath.Join(root, "stealthbox-linux")
+	t.Setenv("STEALTHBOX_TEST_SSH_LOG", log)
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TERM", "dumb")
+	t.Setenv("STEALTHBOX_TEST_HANDSHAKE", "stealthbox-ready-v1 "+buildVersion())
+	ssh := `#!/bin/sh
+while [ "$#" -gt 2 ]; do shift; done
+test "$1" = fixture-vm || exit 23
+shift
+printf '%s\n' "$1" >> "$STEALTHBOX_TEST_SSH_LOG"
+case "$1" in
+	'uname -sm;'*) printf '%s\n' 'Linux x86_64' '/home/fixture' ;;
+	'sh -s') /bin/cat >/dev/null ;;
+	*'upload_tmp='*) /bin/cat >/dev/null ;;
+	*'; mktemp '*'.candidate.'*) printf '%s\n' '/home/fixture/.stealthbox/bin/stealthbox.candidate.test' ;;
+	*' handshake') printf '%s\n' "$STEALTHBOX_TEST_HANDSHAKE" ;;
+	'umask '*|'chmod '*|'mv '*|'rm '*|*theme-apply*|*'for tool in '*) ;;
+	*) printf '%s\n' "unexpected fixture script" >&2; exit 24 ;;
+esac
+`
+	for path, data := range map[string]string{filepath.Join(root, "ssh"): ssh, binary: "synthetic binary"} {
+		if err := os.WriteFile(path, []byte(data), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	setup := []string{"setup", "--host", "fixture-vm", "--runner", "vm", "--config", config}
+	if err := run(ctx, append(setup, "--binary", binary)); err != nil {
+		t.Fatalf("first setup: %v", err)
+	}
+	first, err := stealthbox.Load(config)
+	if err != nil || first.Workspace.VMRoot != "/home/fixture/Projects" || first.Workspace.RemoteDir != "/home/fixture/.stealthbox" || first.Workspace.Theme == "" {
+		t.Fatalf("prepared profile did not store VM paths and a theme: %+v, %v", first.Workspace, err)
+	}
+	if err := run(ctx, setup); err != nil {
+		t.Fatalf("repeated setup: %v", err)
+	}
+	after, err := stealthbox.Load(config)
+	if err != nil || after.Workspace.Theme != first.Workspace.Theme || after.Bridge.Token != first.Bridge.Token {
+		t.Fatal("retry replaced the installed profile identity or theme", err)
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil || strings.Count(string(calls), "\nsh -s\n") != 1 || strings.Count(string(calls), "; mktemp '/home/fixture/.stealthbox/bin/stealthbox.candidate.") != 1 {
+		t.Fatalf("repeat setup should only probe the installed tools and binary: %s, %v", calls, err)
+	}
+}

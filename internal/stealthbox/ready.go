@@ -86,9 +86,7 @@ func prepareRemoteTools(ctx context.Context, c Config, stdout io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	cmd := sshCommand(c.Workspace.Host, "sh -s", false)
-	cmd.Args = append([]string{"-T"}, cmd.Args...)
-	if err := ExecuteNoninteractiveContext(ctx, cmd, strings.NewReader(prepareToolsScript), stdout, stdout); err != nil {
+	if err := ExecuteNoninteractiveContext(ctx, sshWithoutTTY(c.Workspace.Host, "sh -s"), strings.NewReader(prepareToolsScript), stdout, stdout); err != nil {
 		return fmt.Errorf("prepare VM tools (rerun after resolving the error above): %w", err)
 	}
 	return nil
@@ -190,21 +188,28 @@ func prepareWorkspaceTheme(ctx context.Context, c *Config, configPath string, w 
 		theme = []byte(defaultTheme)
 		fmt.Fprintln(w, "Local tmux is unavailable; using the built-in theme. Import your style later with stealthbox theme.")
 	}
+	path, err := writeAutomaticTheme(configPath, theme)
+	if err == nil {
+		c.Workspace.Theme = path
+	}
+	return err
+}
+
+func writeAutomaticTheme(configPath string, theme []byte) (string, error) {
 	dir := filepath.Dir(configPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
+		return "", err
 	}
 	file, err := os.CreateTemp(dir, filepath.Base(configPath)+".tmux-*.conf")
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, writeErr := file.Write(theme)
 	if err := errors.Join(writeErr, file.Close()); err != nil {
 		_ = os.Remove(file.Name())
-		return err
+		return "", err
 	}
-	c.Workspace.Theme = file.Name()
-	return nil
+	return file.Name(), nil
 }
 
 // A generated theme becomes profile state only after the caller saves it.
@@ -216,6 +221,10 @@ func discardUnrecordedTheme(c *Config, previous string, resultErr *error) {
 }
 
 func writePrivate(path string, data []byte) error {
+	return writePrivateFile(path, data, false)
+}
+
+func writePrivateFile(path string, data []byte, create bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
@@ -233,6 +242,9 @@ func writePrivate(path string, data []byte) error {
 	}
 	if closeErr != nil {
 		return closeErr
+	}
+	if create {
+		return os.Link(f.Name(), path)
 	}
 	return os.Rename(f.Name(), path)
 }
