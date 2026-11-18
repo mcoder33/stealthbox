@@ -7,6 +7,24 @@
 или `claude`. Оба агента устанавливаются при подготовке среды; выбирать агента
 в настройках не нужно. Повторный запуск возвращает к текущему окну и процессу.
 
+## Поручить настройку агенту
+
+Скопируй текст ниже и замени `dev-vm` своим SSH-алиасом. Пример настраивает Claude на ВМ и Docker на твоём компьютере. Для Codex замени `--agent claude` на `--agent codex`.
+
+```text
+Установи Stealth Box по https://github.com/mcoder33/stealthbox#быстрый-старт-весь-projects
+и проверь SSH-доступ к dev-vm. На моём компьютере выполни:
+  stealthbox setup --host dev-vm --runner local
+  stealthbox bridge-start
+  stealthbox doctor
+  stealthbox auth-status --agent claude
+
+Если требуется вход, покажи мне команду для оболочки на ВМ и дождись моего
+подтверждения. Затем повтори проверку входа и скажи, как открыть рабочую сессию.
+```
+
+После настройки запускай `stealthbox` в обычном терминале на компьютере.
+
 ```mermaid
 flowchart LR
   subgraph LOCAL[Твой компьютер: macOS / Linux / Windows + WSL2]
@@ -153,14 +171,6 @@ claude auth login           # для Claude Code
 статус входа через `stealthbox auth-status --agent codex` или `--agent claude`.
 Если профиль использует свою команду запуска агента, проверь вход через неё на ВМ
 с аргументами `login status` для Codex или `auth status` для Claude Code.
-
-### Поручить настройку агенту
-
-Подставь свой SSH-алиас, `local` или `vm` и `claude` или `codex`:
-
-> Установи Stealth Box по README проекта `mcoder33/stealthbox`, проверь SSH-алиас
-> `dev-vm` и настрой этот профиль с `--runner local`. Проверь вход в `claude`
-> на ВМ. Если нужен вход, покажи команду для ВМ и дождись, пока я войду сам.
 
 ## Где находятся файлы
 
