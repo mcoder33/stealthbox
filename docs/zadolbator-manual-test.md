@@ -18,7 +18,7 @@ flowchart LR
    (`linux/amd64`, PHP 7.4) и установленный vendor в рабочей копии Zadolbator.
    Архитектуру helper проверяет по метаданным локального образа; Docker Desktop
    выбирает эмуляцию автоматически, без явного `platform` в Compose.
-   Скрипт расположен в `/Users/coder33/Projects/itfinance/stealthbox/tools/`.
+   Скрипт входит в [tools/zadolbator-qa.sh](../tools/zadolbator-qa.sh). В командах ниже подставь вместо `/Users/coder33/Projects/itfinance/stealthbox` абсолютный путь к checkout Stealth Box на Mac: там раннер запускает скрипт.
    Проверь образ: `docker image inspect zadolbator-app:latest`.
    Скрипт не собирает и не перезаписывает его автоматически.
 

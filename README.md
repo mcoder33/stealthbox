@@ -31,6 +31,8 @@ flowchart LR
   L <-->|Только явный import / export| P
 ```
 
+Для установки, обновления и проверки MCP см. [инструкцию для агентов](AGENTS.md).
+
 ## Как выглядит работа
 
 Открываешь обычный терминал вне локального tmux и запускаешь:
@@ -418,7 +420,7 @@ shell-команд агента. Путь может быть относител
 Агент сам читает `AGENTS.md` выбранного репозитория.
 
 Произвольный `docker ...` в shell не перенаправляется: он выполняется на ВМ.
-Для прозрачного выбора исполнителя агент должен использовать `runner_run` или
+Агент вызывает `runner_run`. Для ручного запуска в терминале используй
 `stealthbox run`. Своим агентам можно подключить `stealthbox mcp` как stdio-сервер.
 
 ```mermaid
@@ -638,10 +640,12 @@ stealthbox connect --project example
 make test                         # Go tests + race detector + go vet
 python3 tests/integration/tui.py   # настоящий TUI через pseudo-terminal
 make e2e                          # временный Linux SSH/tmux + локальный Docker
-make release VERSION=v0.4.3        # шесть бинарников и checksums.txt
+make release VERSION=v0.5.1        # шесть бинарников и checksums.txt
 ```
 
-**v0.4.3, свежая проверка кандидата:** Go race/vet, полный SSH/tmux/rsync/Docker E2E
+**v0.5.1:** проверена передача двух PNG по 5,3 МБ через SSH и чтение синтетического снимка в Claude. [Релиз](https://github.com/mcoder33/stealthbox/releases/tag/v0.5.1) · [CI релизного коммита](https://github.com/mcoder33/stealthbox/actions/runs/44307151955).
+
+**v0.4.3:** Go race/vet, полный SSH/tmux/rsync/Docker E2E
 и TUI прошли. Четыре набора Zadolbator через локальный Linux SSH fixture и Mac runner:
 **1264 теста, 5557 assertions; 1262 passed, два incomplete, failures/errors — 0**.
 [Результаты, схема фактического прогона и границы проверки](docs/verification-v0.4.3.md).
