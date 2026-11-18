@@ -166,7 +166,8 @@ func AgentCommand(c Config, configPath, project, agent, runner string, extra []s
 	}
 	if agent == "codex" {
 		args = append(args, "-c", "mcp_servers.stealthbox.command="+JSONString(bin), "-c", "mcp_servers.stealthbox.args="+JSONString([]string{"mcp", "--config", configPath}), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_PROJECT="+JSONString(project), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_RUNNER="+JSONString(runner),
-			"-c", "mcp_servers.stealthbox.env.STEALTHBOX_SCOPE="+JSONString(agentScope(c, project)))
+			"-c", "mcp_servers.stealthbox.env.STEALTHBOX_SCOPE="+JSONString(agentScope(c, project)),
+			"-c", fmt.Sprintf("mcp_servers.stealthbox.tool_timeout_sec=%d", pastedImageTransferTimeout/time.Second+15))
 	}
 	if agent == "claude" {
 		args = append(args, "--append-system-prompt", Guide(project, runner), "--mcp-config", JSONString(map[string]any{"mcpServers": map[string]any{"stealthbox": map[string]any{"command": bin, "args": []string{"mcp", "--config", configPath}, "env": map[string]string{"STEALTHBOX_PROJECT": project, "STEALTHBOX_RUNNER": runner, "STEALTHBOX_SCOPE": agentScope(c, project)}}}}))

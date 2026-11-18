@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"net/http"
@@ -14,10 +16,15 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/image/draw"
 	"golang.org/x/sys/unix"
 )
 
-const pastedImageMaxPixels = 16 << 20
+const (
+	pastedImageMaxPixels = 16 << 20
+	// A 3 MiB image stays below 5 MB even after MCP base64 encoding.
+	pastedImageMaxCompactBytes = 3 << 20
+)
 
 func servePastedImage(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
@@ -26,29 +33,55 @@ func servePastedImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "exactly one pasted-image path is required", http.StatusBadRequest)
 		return
 	}
-	data, err := readPastedImage(r.Context(), paths[0])
+	image, err := readPastedImage(r.Context(), paths[0], r.Header.Get("Accept") == pastedImageAccept)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Content-Type", pastedImageMIME)
-	w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-	_, _ = w.Write(data)
+	w.Header().Set("Content-Type", image.mimeType)
+	w.Header().Set("Content-Length", fmt.Sprint(len(image.data)))
+	_, _ = w.Write(image.data)
 }
 
-func readPastedImage(ctx context.Context, path string) ([]byte, error) {
+func readPastedImage(ctx context.Context, path string, compact bool) (pastedImage, error) {
 	path, err := macPastedImagePath(ctx, path)
 	if err != nil {
-		return nil, err
+		return pastedImage{}, err
 	}
 	data, err := readPastedImageFile(path)
 	if err != nil {
-		return nil, err
+		return pastedImage{}, err
 	}
-	if err := validatePastedPNG(data); err != nil {
-		return nil, err
+	decoded, err := decodePastedPNG(data)
+	if err != nil {
+		return pastedImage{}, err
 	}
-	return data, nil
+	if compact && (len(data) > pastedImageMaxCompactBytes || max(decoded.Bounds().Dx(), decoded.Bounds().Dy()) > 8000) {
+		return compactPastedImage(decoded)
+	}
+	return pastedImage{mimeType: pastedImagePNG, data: data}, nil
+}
+
+func compactPastedImage(source image.Image) (pastedImage, error) {
+	for _, encoding := range []struct{ edge, quality int }{{2048, 92}, {1600, 86}} {
+		w, h := source.Bounds().Dx(), source.Bounds().Dy()
+		longEdge := max(w, h)
+		if longEdge > encoding.edge {
+			w = max(1, (w*encoding.edge+longEdge/2)/longEdge)
+			h = max(1, (h*encoding.edge+longEdge/2)/longEdge)
+		}
+		scaled := image.NewRGBA(image.Rect(0, 0, w, h))
+		draw.Draw(scaled, scaled.Bounds(), image.White, image.Point{}, draw.Src)
+		draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), source, source.Bounds(), draw.Over, nil)
+		var out bytes.Buffer
+		if err := jpeg.Encode(&out, scaled, &jpeg.Options{Quality: encoding.quality}); err != nil {
+			return pastedImage{}, fmt.Errorf("could not encode pasted image for transfer")
+		}
+		if out.Len() <= pastedImageMaxCompactBytes {
+			return pastedImage{mimeType: pastedImageJPEG, data: out.Bytes()}, nil
+		}
+	}
+	return pastedImage{}, fmt.Errorf("pasted image is too large after resizing")
 }
 
 func macPastedImagePath(ctx context.Context, path string) (string, error) {
@@ -117,17 +150,18 @@ func privateDarwinPath(path string) string {
 	return path
 }
 
-func validatePastedPNG(data []byte) error {
+func decodePastedPNG(data []byte) (image.Image, error) {
 	cfg, err := png.DecodeConfig(bytes.NewReader(data))
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
-		return fmt.Errorf("pasted image is not a valid PNG")
+		return nil, fmt.Errorf("pasted image is not a valid PNG")
 	}
 	if cfg.Width > pastedImageMaxPixels/cfg.Height {
-		return fmt.Errorf("pasted image exceeds 16 megapixels")
+		return nil, fmt.Errorf("pasted image exceeds 16 megapixels")
 	}
 	reader := bytes.NewReader(data)
-	if _, err := png.Decode(reader); err != nil || reader.Len() != 0 {
-		return fmt.Errorf("pasted image is not a valid PNG")
+	decoded, err := png.Decode(reader)
+	if err != nil || reader.Len() != 0 {
+		return nil, fmt.Errorf("pasted image is not a valid PNG")
 	}
-	return nil
+	return decoded, nil
 }
