@@ -196,6 +196,10 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 				continue
 			}
 		}
+		// Older VM binaries can still forward an unoccupied socket.
+		recovery, finish := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = Output(recovery, sshCommand(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-recover-socket", "--config", remoteCfg}), false))
+		finish()
 		cmd := sshCommand(c.Workspace.Host, "", false)
 		cmd.Args = cmd.Args[:len(cmd.Args)-1]
 		cmd.Args = append([]string{"-N", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
@@ -204,7 +208,7 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		fmt.Fprintln(log, "Check the reverse SSH error above; an occupied remote socket needs its owner stopped or a stale socket removed manually.")
+		fmt.Fprintln(log, "Check the reverse SSH error above; verify the VM binary is current and check for another active bridge.")
 		if err = pause(ctx, delay, log); err != nil {
 			return nil
 		}

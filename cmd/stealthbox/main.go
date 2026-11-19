@@ -334,6 +334,11 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.Doctor(ctx, c, os.Stdout)
+	case "bridge-recover-socket":
+		if *dry || c.Bridge.Socket != c.Bridge.RemoteSocket || c.Bridge.RemoteSocket == "" {
+			return nil
+		}
+		return stealthbox.RecoverRemoteSocket(ctx, c.Bridge.RemoteSocket)
 	case "bridge-health":
 		if *dry {
 			fmt.Println("Would check bridge health")
