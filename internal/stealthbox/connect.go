@@ -14,7 +14,7 @@ import (
 type ConnectOptions struct {
 	Project, Agent, Runner, Slot, Binary, Session string
 	Extra                                         []string
-	Reconnect                                     bool
+	Direct, Reconnect                             bool
 	Resume                                        bool
 }
 
@@ -52,6 +52,11 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 	}
 	if _, configured := p.Runners[o.Runner]; ok && !configured {
 		return fmt.Errorf("runner is not configured")
+	}
+	if o.Direct {
+		if err := configureDirectSSH(ctx, c.Workspace.Host, stderr); err != nil {
+			return err
+		}
 	}
 	if err := EnsureReady(ctx, c, path, o.Binary, stderr); err != nil {
 		return err

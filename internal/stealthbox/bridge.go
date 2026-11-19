@@ -456,6 +456,9 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 
 func configHash(c Config) string {
 	b, _ := json.Marshal(c)
+	if transport := os.Getenv("STEALTHBOX_SSH_CONFIG"); transport != "" {
+		b = append(append(b, 0), transport...)
+	}
 	h := sha256.Sum256(b)
 	return fmt.Sprintf("%x", h)
 }

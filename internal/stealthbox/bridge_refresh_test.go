@@ -130,7 +130,8 @@ func TestBridgeRefreshPreservesBusyRunThenAppliesConfig(t *testing.T) {
 	c.Workspace.Host = "fixture-vm"
 	c.Workspace.RemoteDir = filepath.Join(root, "state")
 	c.Bridge.Socket = filepath.Join(root, "mac.sock")
-	c.Bridge.RemoteSocket = filepath.Join(root, "remote.sock")
+	// The SSH fixture runs the VM probe locally without forwarding sockets.
+	c.Bridge.RemoteSocket = c.Bridge.Socket
 	c.Bridge.AllowExec = true
 	if err := os.MkdirAll(filepath.Join(c.Workspace.RemoteDir, "bin"), 0700); err != nil {
 		t.Fatal(err)

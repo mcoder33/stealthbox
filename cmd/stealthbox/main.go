@@ -127,12 +127,16 @@ func run(ctx context.Context, args []string) error {
 	cwd := f.String("cwd", "", "command directory relative to the selected checkout")
 	noAttach := f.Bool("no-attach", false, "create/select window without attaching (VM command)")
 	resumeWorkspace := f.Bool("resume-workspace", false, "resume the current workspace window (internal)")
+	direct := f.Bool("direct", false, "macOS: bind SSH first hop to the physical network")
 	reconnect := f.Bool("reconnect", true, "reconnect after SSH transport failure")
 	artifact := f.String("file", "", "artifact path relative to Mac runner")
 	output := f.String("output", "", "local output file (must not exist)")
 	edit := f.Bool("edit", false, "edit config with EDITOR")
 	if err = f.Parse(parseArgs); err != nil {
 		return err
+	}
+	if *direct && args[0] != "connect" && args[0] != "open" {
+		return fmt.Errorf("--direct is supported by connect/open")
 	}
 	visited := map[string]bool{}
 	f.Visit(func(value *flag.Flag) { visited[value.Name] = true })
@@ -488,7 +492,7 @@ func run(ctx context.Context, args []string) error {
 			fmt.Printf("Mac terminal → SSH %s → %s workspace; project=%s agent=%s runner=%s slot=%s; Mac bridge=%t\n", c.Workspace.Host, *session, *project, *agent, *runner, *slot, c.Bridge.Enabled)
 			return nil
 		}
-		return stealthbox.Connect(ctx, &c, *config, stealthbox.ConnectOptions{Project: *project, Agent: *agent, Runner: requestedRunner, Slot: *slot, Binary: *binary, Extra: f.Args(), Reconnect: *reconnect, Session: *session, Resume: resume}, os.Stdout, os.Stderr)
+		return stealthbox.Connect(ctx, &c, *config, stealthbox.ConnectOptions{Project: *project, Agent: *agent, Runner: requestedRunner, Slot: *slot, Binary: *binary, Extra: f.Args(), Direct: *direct, Reconnect: *reconnect, Session: *session, Resume: resume}, os.Stdout, os.Stderr)
 	case "workspace":
 		if *dry {
 			fmt.Println(stealthbox.WindowName(*project, *agent, *runner, *slot, f.Args()))
@@ -566,6 +570,7 @@ func usage() {
 	fmt.Println(`Stealth Box — your terminal, remote tmux, agents and a selectable Mac/VM runner
 
   stealthbox                         Prepare and resume your remote tmux workspace
+  stealthbox connect --direct        macOS: reach the SSH first hop over the physical LAN
   stealthbox settings [--config PATH] Optional settings and diagnostics (alias: tui)
   stealthbox init --host dev-vm [--runner local|vm] [--allow-mac-exec]
   stealthbox config --vm-root '~/Projects' --local-root ~/Projects --runner-root ~/.local/share/stealthbox/runners --shell-integration
