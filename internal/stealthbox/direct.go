@@ -27,6 +27,17 @@ func sshSetting(output, key string) string {
 	return ""
 }
 
+// Darwin route(8) can print "not in table" and return success.
+func scopedRouteFound(output, device string) (bool, error) {
+	if sshSetting(output, "interface:") == device {
+		return true, nil
+	}
+	if strings.TrimSpace(output) == "route: writing to routing socket: not in table" {
+		return false, nil
+	}
+	return false, fmt.Errorf("could not verify scoped route on %s: %s", device, strings.TrimSpace(output))
+}
+
 // Limit this mode to one numeric IPv4 endpoint, optionally reached via one jump.
 func directFirstHop(alias, config string) (string, string, error) {
 	name, ip := alias, sshSetting(config, "hostname")
@@ -97,7 +108,15 @@ func configureDirectSSH(ctx context.Context, alias string, log io.Writer) error 
 	if err = probe(); err != nil {
 		// Only provision a missing scoped route. A TCP failure on an existing route
 		// may be a firewall or an unreachable server, neither is fixed by replacing it.
-		if _, e := exec.CommandContext(ctx, "/sbin/route", "-n", "get", "-ifscope", device, ip).Output(); e == nil {
+		lookup, lookupErr := exec.CommandContext(ctx, "/sbin/route", "-n", "get", "-ifscope", device, ip).CombinedOutput()
+		found, parseErr := scopedRouteFound(string(lookup), device)
+		if parseErr != nil {
+			return parseErr
+		}
+		if found && lookupErr != nil {
+			return fmt.Errorf("checking scoped route: %w", lookupErr)
+		}
+		if found {
 			return fmt.Errorf("SSH gateway %s:%s is unreachable on %s; check VPN split tunneling", ip, port, device)
 		}
 		fmt.Fprintf(log, "Direct SSH needs a scoped host route to %s via %s (%s). To remove: sudo /sbin/route -n delete -host -ifscope %s %s %s\n", ip, gateway, device, device, ip, gateway)

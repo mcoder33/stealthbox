@@ -67,3 +67,20 @@ func TestDirectSSHConfigKeepsTargetAndBindsJump(t *testing.T) {
 		}
 	}
 }
+
+func TestScopedRouteLookup(t *testing.T) {
+	for _, tc := range []struct {
+		output         string
+		found, wantErr bool
+	}{
+		{"route: writing to routing socket: not in table\n", false, false},
+		{"   route to: 192.0.2.10\n  interface: en0\n", true, false},
+		{"route: permission denied", false, true},
+		{"interface: utun5", false, true},
+	} {
+		found, err := scopedRouteFound(tc.output, "en0")
+		if found != tc.found || (err != nil) != tc.wantErr {
+			t.Fatalf("lookup %q returned %v, %v", tc.output, found, err)
+		}
+	}
+}
