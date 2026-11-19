@@ -60,6 +60,26 @@ func directFirstHop(alias, config string) (string, string, error) {
 	return name, ip, nil
 }
 
+var physicalInterface = regexp.MustCompile(`^en[0-9]+$`)
+
+// netstat -rn -f inet lists scoped defaults even when route get default returns a utun.
+func physicalTableDefault(table string) (device, gateway string, err error) {
+	for _, row := range strings.Split(table, "\n") {
+		f := strings.Fields(row)
+		if len(f) < 4 || f[0] != "default" || !strings.Contains(f[2], "UG") || !physicalInterface.MatchString(f[3]) || net.ParseIP(f[1]).To4() == nil {
+			continue
+		}
+		if device != "" && (device != f[3] || gateway != f[1]) {
+			return "", "", fmt.Errorf("multiple physical IPv4 defaults; cannot select a direct interface")
+		}
+		device, gateway = f[3], f[1]
+	}
+	if device == "" {
+		return "", "", fmt.Errorf("no physical IPv4 default gateway found")
+	}
+	return device, gateway, nil
+}
+
 func configureDirectSSH(ctx context.Context, alias string, log io.Writer) error {
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("--direct requires macOS")
@@ -99,8 +119,15 @@ func configureDirectSSH(ctx context.Context, alias string, log io.Writer) error 
 		return err
 	}
 	device, gateway := sshSetting(string(out), "interface:"), sshSetting(string(out), "gateway:")
-	if !regexp.MustCompile(`^en[0-9]+$`).MatchString(device) || net.ParseIP(gateway).To4() == nil {
-		return fmt.Errorf("no physical IPv4 default gateway found; configure a VPN exclusion for %s/32", ip)
+	if !physicalInterface.MatchString(device) || net.ParseIP(gateway).To4() == nil {
+		table, e := exec.CommandContext(ctx, "/usr/sbin/netstat", "-rn", "-f", "inet").Output()
+		if e != nil {
+			return fmt.Errorf("read macOS IPv4 routing table: %w", e)
+		}
+		device, gateway, err = physicalTableDefault(string(table))
+		if err != nil {
+			return err
+		}
 	}
 	probe := func() error {
 		return exec.CommandContext(ctx, "/usr/bin/nc", "-4", "-z", "-G", "5", "-b", device, ip, port).Run()

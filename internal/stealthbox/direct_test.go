@@ -84,3 +84,16 @@ func TestScopedRouteLookup(t *testing.T) {
 		}
 	}
 }
+
+func TestPhysicalDefaultInVPNRoutingTable(t *testing.T) {
+	const routes = "Internet:\nDestination Gateway Flags Netif Expire\ndefault link#24 UCSg utun5\ndefault 192.168.31.1 UGScIg en0\n"
+	device, gw, err := physicalTableDefault(routes)
+	if err != nil || device != "en0" || gw != "192.168.31.1" {
+		t.Fatalf("%q %q %v", device, gw, err)
+	}
+	for _, table := range []string{"default link#24 UCSg utun5", routes + "default 10.0.0.1 UGScIg en2\n"} {
+		if _, _, err := physicalTableDefault(table); err == nil {
+			t.Fatal("expected unavailable or ambiguous default")
+		}
+	}
+}
