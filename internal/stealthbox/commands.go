@@ -165,12 +165,6 @@ func Open(p Project, name, session, runner string, command []string) (Command, e
 	}
 	return At(p.Source, script, true), nil
 }
-func location(e Endpoint) string {
-	if e.Host == "" {
-		return e.Path + "/"
-	}
-	return e.Host + ":" + e.Path + "/"
-}
 func PlanRun(p Project, runner string, args []string) ([]Command, error) {
 	dst, ok := p.Runners[runner]
 	if !ok {
