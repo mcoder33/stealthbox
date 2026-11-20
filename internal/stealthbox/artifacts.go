@@ -85,7 +85,7 @@ func Fetch(ctx context.Context, c Config, project, rel, output string) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Bridge.Token)
-	res, err := bridgeHTTP(c.Bridge.Socket).Do(req)
+	res, err := c.bridgeClient().Do(req)
 	if err != nil {
 		return err
 	}

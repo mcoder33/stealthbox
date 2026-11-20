@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -58,8 +59,18 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 			return err
 		}
 	}
-	if err := EnsureReady(ctx, c, path, o.Binary, stderr); err != nil {
-		return err
+	for delay := time.Second; ; delay = backoff(delay) {
+		err := EnsureReady(ctx, c, path, o.Binary, stderr)
+		if err == nil {
+			break
+		}
+		if !o.Reconnect || !temporarySSHFailure(err) {
+			return err
+		}
+		fmt.Fprintln(stderr, err)
+		if err = pause(ctx, delay, stderr); err != nil {
+			return err
+		}
 	}
 	if c.Bridge.Enabled {
 		bridgeCtx := ctx
@@ -69,7 +80,16 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 		}
 		bridgeErr := StartBridgeService(bridgeCtx, *c, path, stderr)
 		if bridgeErr == nil {
-			bridgeErr = WaitRemoteBridge(bridgeCtx, *c)
+			for {
+				bridgeErr = WaitRemoteBridge(bridgeCtx, *c)
+				if !o.Reconnect || bridgeCtx.Err() != nil || bridgeErr == nil {
+					break
+				}
+				if !errors.Is(bridgeErr, context.DeadlineExceeded) && !temporarySSHFailure(bridgeErr) {
+					break
+				}
+				fmt.Fprintln(stderr, "Waiting for the VM-to-Mac connection. Ctrl-C to stop.")
+			}
 		}
 		cancelBridge()
 		if bridgeErr != nil {
@@ -133,6 +153,25 @@ func Connect(ctx context.Context, c *Config, path string, o ConnectOptions, stdo
 		delay = backoff(delay)
 	}
 }
+
+// Authentication and host-key errors also exit 255 and need user attention.
+func temporarySSHFailure(err error) bool {
+	var failed *exec.ExitError
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if !errors.As(err, &failed) || failed.ExitCode() != 255 {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, reason := range []string{"timed out", "connection closed", "connection reset", "connection refused", "no route to host", "network is unreachable", "network is down", "broken pipe"} {
+		if strings.Contains(message, reason) {
+			return true
+		}
+	}
+	return false
+}
+
 func backoff(d time.Duration) time.Duration {
 	if d < 15*time.Second {
 		return d * 2

@@ -338,6 +338,14 @@ func run(ctx context.Context, args []string) error {
 			return nil
 		}
 		return stealthbox.Doctor(ctx, c, os.Stdout)
+	case "bridge-hold-forward":
+		if *dry {
+			return nil
+		}
+		if f.NArg() != 1 {
+			return fmt.Errorf("expected forward name")
+		}
+		return stealthbox.HoldBridgeForward(ctx, c, f.Arg(0))
 	case "bridge-recover-socket":
 		if *dry || c.Bridge.Socket != c.Bridge.RemoteSocket || c.Bridge.RemoteSocket == "" {
 			return nil

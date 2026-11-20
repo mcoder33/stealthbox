@@ -47,7 +47,13 @@ func resolveRemote(ctx context.Context, c *Config) (string, string, error) {
 		return "", "", fmt.Errorf("configure workspace.host with an SSH alias")
 	}
 	c.Workspace.Host = host
-	out, err := Output(ctx, sshCommand(host, "uname -sm; printf '%s\\n' \"$HOME\"", false))
+	probe := sshWithoutTTY(host, "uname -sm; printf '%s\\n' \"$HOME\"")
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	out, err := noninteractiveOutput(probeCtx, probe)
+	if probeCtx.Err() != nil {
+		err = probeCtx.Err()
+	}
+	cancel()
 	if err != nil {
 		return "", "", fmt.Errorf("SSH probe failed: %w (test ssh %s first)", err, host)
 	}

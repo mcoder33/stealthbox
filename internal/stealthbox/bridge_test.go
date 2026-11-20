@@ -372,7 +372,7 @@ func TestBridgeServiceTunnelProbesConnection(t *testing.T) {
 	for deadline := time.Now().Add(5 * time.Second); tunnel == "" && time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 		b, _ := os.ReadFile(calls)
 		for _, line := range strings.Split(string(b), "\n") {
-			if strings.HasPrefix(line, "-N ") {
+			if strings.Contains(line, "bridge-hold-forward") {
 				tunnel = line
 			}
 		}

@@ -72,7 +72,9 @@ func fetchPastedImage(ctx context.Context, c Config, path string) (pastedImage, 
 	}
 	req.Header.Set("Accept", pastedImageAccept)
 	req.Header.Set("Authorization", "Bearer "+c.Bridge.Token)
-	res, err := bridgeHTTP(c.Bridge.Socket).Do(req)
+	client := c.bridgeClient()
+	client.Transport.(*http.Transport).ResponseHeaderTimeout = 5 * time.Second
+	res, err := client.Do(req)
 	if err != nil {
 		return pastedImage{}, pastedImageTransportError(err, "could not reach the bridge")
 	}

@@ -248,7 +248,7 @@ func TestBridgeTunnelDoesNotRemoveOccupiedRemoteSocket(t *testing.T) {
 	c := reconnectFixture(t)
 	sshDir := localDeploymentSSH(t)
 	readyPath := filepath.Join(c.Workspace.RemoteDir, "tunnel-ready")
-	program := "#!/bin/sh\ncase \" $* \" in *' -N '*) printf ready > " + Quote(readyPath) + "; exec sleep 60;; esac\nwhile [ \"$#\" -gt 1 ]; do shift; done\ncase \"$1\" in *bridge-health*) exit 1;; esac\nexec /bin/sh -c \"$1\"\n"
+	program := "#!/bin/sh\ncase \" $* \" in *'bridge-hold-forward'*) printf ready > " + Quote(readyPath) + "; exec sleep 60;; esac\nwhile [ \"$#\" -gt 1 ]; do shift; done\ncase \"$1\" in *bridge-health*) exit 1;; esac\nexec /bin/sh -c \"$1\"\n"
 	if err := os.WriteFile(filepath.Join(sshDir, "ssh"), []byte(program), 0700); err != nil {
 		t.Fatal(err)
 	}

@@ -39,6 +39,7 @@ type Event struct {
 	Data   string `json:"data,omitempty"`
 	Code   int    `json:"code,omitempty"`
 }
+
 // eventWriter streams command output as JSON strings. A UTF-8 sequence split
 // between pipe reads is held back until complete, so it is not replaced by U+FFFD.
 type eventWriter struct {
@@ -394,9 +395,13 @@ func bridgeHTTP(socket string) *http.Client {
 	}, DisableKeepAlives: true}}
 }
 func BridgeHealth(ctx context.Context, c Config) error {
-	client := bridgeHTTP(c.Bridge.Socket)
-	req, _ := http.NewRequestWithContext(ctx, "GET", "http://unix/health", nil)
-	req.Header.Set("Authorization", "Bearer "+c.Bridge.Token)
+	return checkBridgeClient(ctx, c.bridgeClient(), c.Bridge.Token)
+}
+func checkBridgeClient(ctx context.Context, client *http.Client, token string) error {
+	probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(probe, "GET", "http://unix/health", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("Mac bridge unavailable: %w", err)
@@ -418,6 +423,10 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 	p := resolved.Project
 	if snapshot && p.Source.Host != "" {
 		return fmt.Errorf("run the bridge client on the source VM")
+	}
+	client := c.bridgeClient()
+	if err := checkBridgeClient(ctx, client, c.Bridge.Token); err != nil {
+		return fmt.Errorf("execution=not_started: Mac bridge check failed before sending the command. Retry when the Mac bridge is ready: %w", err)
 	}
 	transport := runnerSyncTransport(c, p)
 	max, _ := limits(c)
@@ -453,6 +462,24 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 	if err != nil {
 		return err
 	}
+	// Probe the same tunnel as this request, even if recovery publishes a new one.
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		tick := time.NewTicker(15 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if err := checkBridgeClient(ctx, client, c.Bridge.Token); err != nil {
+					stop()
+					return
+				}
+			}
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, "POST", "http://unix/run", body)
 	if err != nil {
 		return err
@@ -463,9 +490,13 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 		stat, _ := archive.Stat()
 		req.ContentLength = stat.Size()
 	}
-	res, err := bridgeHTTP(c.Bridge.Socket).Do(req)
+	res, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("Mac is disconnected or unavailable: %w", err)
+		var dial *net.OpError
+		if errors.As(err, &dial) && dial.Op == "dial" {
+			return fmt.Errorf("execution=not_started: Mac disconnected before sending the command. Retry after reconnect: %w", err)
+		}
+		return fmt.Errorf("execution=unknown: lost the Mac response. Check the command result before retrying: %w", err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
@@ -476,7 +507,7 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 	for {
 		var e Event
 		if err = dec.Decode(&e); err != nil {
-			return fmt.Errorf("Mac command stream ended without a result; do not retry automatically: %w", err)
+			return fmt.Errorf("execution=unknown: Mac command stream ended without a result; check its effects before retrying: %w", err)
 		}
 		switch e.Stream {
 		case "stdout":
@@ -503,7 +534,7 @@ func configHash(c Config) string {
 	if transport := os.Getenv("STEALTHBOX_SSH_CONFIG"); transport != "" {
 		b = append(append(b, 0), transport...)
 	}
-	h := sha256.Sum256(b)
+	h := sha256.Sum256(append(b, []byte("per-session-forward-v1")...))
 	return fmt.Sprintf("%x", h)
 }
 

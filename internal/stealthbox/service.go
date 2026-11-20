@@ -186,7 +186,7 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 			return nil
 		}
 		probe, end := context.WithTimeout(ctx, 5*time.Second)
-		_, err := Output(probe, sshCommand(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-health", "--config", remoteCfg}), false))
+		_, err := noninteractiveOutput(probe, sshCommand(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-health", "--config", remoteCfg}), false))
 		end()
 		if err == nil {
 			select {
@@ -196,22 +196,19 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 				continue
 			}
 		}
-		// Older VM binaries can still forward an unoccupied socket.
-		recovery, finish := context.WithTimeout(ctx, 5*time.Second)
-		_, _ = Output(recovery, sshCommand(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-recover-socket", "--config", remoteCfg}), false))
-		finish()
-		cmd := sshCommand(c.Workspace.Host, "", false)
-		cmd.Args = cmd.Args[:len(cmd.Args)-1]
-		// Keepalives end ssh -N on a dead network path (sleep, Wi-Fi/VPN change),
-		// so the loop reconnects instead of holding a silent tunnel for hours.
-		cmd.Args = append([]string{"-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
+		name := newForwardName()
+		socket := filepath.Join(filepath.Dir(c.Bridge.RemoteSocket), name)
+		cmd := sshWithoutTTY(c.Workspace.Host, shellArgs([]string{remoteBin, "bridge-hold-forward", "--config", remoteCfg, "--", name}))
+		cmd.Args = append([]string{"-S", "none", "-o", "ConnectTimeout=10", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", socket + ":" + c.Bridge.Socket}, cmd.Args...)
 		fmt.Fprintln(log, "Connecting Mac bridge to", c.Workspace.Host)
 		connected := time.Now()
-		err = ExecuteContext(ctx, cmd, nil, io.Discard, log)
+		err = ExecuteNoninteractiveContext(ctx, cmd, nil, io.Discard, log)
 		if ctx.Err() != nil {
 			return nil
 		}
-		fmt.Fprintf(log, "Reverse SSH ended: %v. Check the error above; verify the VM binary is current and check for another active bridge.\n", err)
+		if err != nil {
+			fmt.Fprintf(log, "Reverse SSH ended: %v\n", err)
+		}
 		if time.Since(connected) > time.Minute {
 			delay = time.Second
 		}
@@ -230,7 +227,7 @@ func CheckRemoteBridge(ctx context.Context, c Config) error {
 	bin := filepath.Join(c.Workspace.RemoteDir, "bin", "stealthbox")
 	cfg := filepath.Join(c.Workspace.RemoteDir, "config.json")
 	cmd := sshWithoutTTY(c.Workspace.Host, shellArgs([]string{bin, "bridge-health", "--config", cfg}))
-	err := ExecuteNoninteractiveContext(ctx, cmd, nil, io.Discard, io.Discard)
+	_, err := noninteractiveOutput(ctx, cmd)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -245,10 +242,17 @@ func CheckRemoteBridge(ctx context.Context, c Config) error {
 }
 
 func WaitRemoteBridge(ctx context.Context, c Config) error {
-	wait, cancel := context.WithTimeout(ctx, 20*time.Second)
+	wait, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	for {
 		err := CheckRemoteBridge(wait, c)
+		var failed *exec.ExitError
+		if errors.As(err, &failed) && failed.ExitCode() == 255 && !temporarySSHFailure(err) {
+			return err
+		}
+		if err != nil && strings.Contains(err.Error(), "HTTP 401") {
+			return err
+		}
 		if err == nil {
 			return nil
 		}
@@ -258,7 +262,7 @@ func WaitRemoteBridge(ctx context.Context, c Config) error {
 				return ctx.Err()
 			}
 			return fmt.Errorf("VM-to-Mac bridge not verified: %w; see %s.log", err, c.Bridge.Socket)
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(time.Second):
 		}
 	}
 }
