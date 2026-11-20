@@ -18,6 +18,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 type ExitError struct{ Code int }
@@ -38,24 +39,62 @@ type Event struct {
 	Data   string `json:"data,omitempty"`
 	Code   int    `json:"code,omitempty"`
 }
+// eventWriter streams command output as JSON strings. A UTF-8 sequence split
+// between pipe reads is held back until complete, so it is not replaced by U+FFFD.
 type eventWriter struct {
-	mu     *sync.Mutex
-	enc    *json.Encoder
-	flush  http.Flusher
-	stream string
+	mu      *sync.Mutex
+	enc     *json.Encoder
+	flush   http.Flusher
+	stream  string
+	pending []byte
 }
 
-func (w eventWriter) Write(p []byte) (int, error) {
+func (w *eventWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	err := w.enc.Encode(Event{Stream: w.stream, Data: string(p)})
-	if w.flush != nil {
-		w.flush.Flush()
+	data := append(w.pending, p...)
+	complete := completeUTF8Prefix(data)
+	w.pending = append([]byte(nil), data[complete:]...)
+	if complete == 0 {
+		return len(p), nil
 	}
-	if err != nil {
+	if err := w.emit(data[:complete]); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// Close emits a trailing sequence that never completed.
+func (w *eventWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) == 0 {
+		return nil
+	}
+	data := w.pending
+	w.pending = nil
+	return w.emit(data)
+}
+
+func (w *eventWriter) emit(data []byte) error {
+	err := w.enc.Encode(Event{Stream: w.stream, Data: string(data)})
+	if w.flush != nil {
+		w.flush.Flush()
+	}
+	return err
+}
+
+// completeUTF8Prefix returns the length of b without a trailing incomplete UTF-8 sequence.
+func completeUTF8Prefix(b []byte) int {
+	for i := len(b) - 1; i >= 0 && i > len(b)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(b[i]) {
+			if utf8.FullRune(b[i:]) {
+				return len(b)
+			}
+			return i
+		}
+	}
+	return len(b)
 }
 func limits(c Config) (int64, time.Duration) {
 	m := c.Bridge.MaxBytes
@@ -208,8 +247,10 @@ func BridgeHandler(c Config) http.Handler {
 		if resolved.StaticName == "" {
 			cmd.Env = append(cmd.Env, "COMPOSE_PROJECT_NAME="+resolved.ID)
 		}
-		cmd.Stdout = eventWriter{mu, enc, flusher, "stdout"}
-		cmd.Stderr = eventWriter{mu, enc, flusher, "stderr"}
+		stdout := &eventWriter{mu: mu, enc: enc, flush: flusher, stream: "stdout"}
+		stderr := &eventWriter{mu: mu, enc: enc, flush: flusher, stream: "stderr"}
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
 		if _, err := io.WriteString(cmd.Stderr, executionReceipt(resolved, "mac", cwd, syncStatus, syncTransport)); err != nil {
 			return
 		}
@@ -222,7 +263,10 @@ func BridgeHandler(c Config) http.Handler {
 		}
 		cmd.WaitDelay = 2 * time.Second
 		code := 0
-		if err = cmd.Run(); err != nil {
+		err = cmd.Run()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		if err != nil {
 			code = 1
 			var ex *exec.ExitError
 			if errors.As(err, &ex) {

@@ -286,3 +286,32 @@ func TestArtifactReadStaysInsideRunner(t *testing.T) {
 		}
 	}
 }
+
+func TestBridgeKeepsUTF8SplitAcrossWrites(t *testing.T) {
+	c := bridgeConfig(t)
+	c.Bridge.AllowExec = true
+	if e := os.MkdirAll(c.Projects["test"].Runners["mac"].Path, 0700); e != nil {
+		t.Fatal(e)
+	}
+	script := `printf 'split: \320'; sleep 0.2; printf '\260\n'`
+	w := requestBridge(t, BridgeHandler(c), c, RunRequest{Project: "test", Args: []string{"sh", "-c", script}}, nil, c.Bridge.Token)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var stdout string
+	dec := json.NewDecoder(w.Body)
+	for {
+		var e Event
+		if err := dec.Decode(&e); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if e.Stream == "stdout" {
+			stdout += e.Data
+		}
+	}
+	if stdout != "split: а\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+}
