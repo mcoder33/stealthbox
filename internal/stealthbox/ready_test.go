@@ -118,6 +118,12 @@ func isolatedTmux(t *testing.T) func(...string) string {
 	t.Setenv("TMUX_TMPDIR", dir)
 	t.Setenv("TMUX", "")
 	t.Setenv("SHELL", "/bin/bash")
+	// A run inside a Stealth Box runner or a tmux pane inherits session state
+	// that would pin the runner or retarget tmux commands.
+	for _, name := range []string{"TMUX_PANE", "STEALTHBOX_RUNNER", "STEALTHBOX_RUNNER_SOURCE", "STEALTHBOX_PROJECT", "STEALTHBOX_SCOPE"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
