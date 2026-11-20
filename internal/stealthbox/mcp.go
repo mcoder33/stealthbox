@@ -122,27 +122,8 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 						}
 					}
 				} else {
-					selector := arguments.Project
-					if arguments.Path != "" {
-						if selector != "" {
-							err = fmt.Errorf("choose either project or path, not both")
-						} else {
-							selector, err = WorkspaceCheckoutPath(c, arguments.Path)
-						}
-					}
-					if workspaceMCPScope(c) {
-						if selector == "" {
-							err = fmt.Errorf("workspace tools require a checkout path on every call")
-						}
-					} else {
-						bound := os.Getenv("STEALTHBOX_PROJECT")
-						if selector == "" {
-							selector = bound
-						}
-						if arguments.Path != "" || (bound != "" && selector != bound) {
-							err = fmt.Errorf("this agent's tools are bound to project %s", bound)
-						}
-					}
+					var selector string
+					selector, err = mcpSelector(c, arguments.Project, arguments.Path)
 					runner := arguments.Runner
 					if runner == "" {
 						runner = envOr("STEALTHBOX_RUNNER", "vm")
@@ -196,6 +177,31 @@ func ServeMCP(ctx context.Context, c Config, in io.Reader, out io.Writer) error 
 	}
 	return scan.Err()
 }
+// mcpSelector chooses the project or checkout for an execution tool call and
+// returns the first specific reason a selection is rejected.
+func mcpSelector(c Config, project, path string) (string, error) {
+	if path != "" && project != "" {
+		return "", fmt.Errorf("choose either project or path, not both")
+	}
+	if workspaceMCPScope(c) {
+		if path == "" && project == "" {
+			return "", fmt.Errorf("workspace tools require a checkout path on every call")
+		}
+		if path == "" {
+			return project, nil
+		}
+		return WorkspaceCheckoutPath(c, path)
+	}
+	bound := os.Getenv("STEALTHBOX_PROJECT")
+	if path != "" || (bound != "" && project != "" && project != bound) {
+		return "", fmt.Errorf("this agent's tools are bound to project %s", bound)
+	}
+	if project == "" {
+		return bound, nil
+	}
+	return project, nil
+}
+
 func envOr(k, d string) string {
 	if s := os.Getenv(k); s != "" {
 		return s

@@ -262,3 +262,17 @@ func TestWorkspaceCheckoutCannotBypassDefaultExclusions(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkspaceMCPReportsWhyCheckoutPathIsRejected(t *testing.T) {
+	c := rootConfig(t)
+	t.Setenv("STEALTHBOX_SCOPE", "workspace")
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vm_exec","arguments":{"path":"../outside","argv":["true"]}}}
+`
+	var out bytes.Buffer
+	if err := ServeMCP(context.Background(), c, strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "checkout path must stay inside workspace") {
+		t.Fatal(out.String())
+	}
+}
