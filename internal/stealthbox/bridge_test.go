@@ -345,3 +345,46 @@ func TestArchiveSyncRecoversFromInterruptedSwap(t *testing.T) {
 		}
 	}
 }
+
+// The reverse tunnel must notice a dead network path instead of hanging in ssh -N.
+func TestBridgeServiceTunnelProbesConnection(t *testing.T) {
+	c := bridgeConfig(t)
+	short, e := os.MkdirTemp("", "sb")
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(func() { os.RemoveAll(short) })
+	c.Bridge.Socket = filepath.Join(short, "m.sock")
+	t.Setenv("STEALTHBOX_SSH_CONFIG", "")
+	c.Workspace.RemoteDir = "/home/dev/.stealthbox"
+	c.Bridge.RemoteSocket = "/home/dev/.stealthbox/run/mac.sock"
+	bin := t.TempDir()
+	calls := filepath.Join(bin, "calls")
+	ssh := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + Quote(calls) + "\nexit 1\n"
+	if e := os.WriteFile(filepath.Join(bin, "ssh"), []byte(ssh), 0700); e != nil {
+		t.Fatal(e)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- BridgeService(ctx, c, io.Discard) }()
+	var tunnel string
+	for deadline := time.Now().Add(5 * time.Second); tunnel == "" && time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		b, _ := os.ReadFile(calls)
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "-N ") {
+				tunnel = line
+			}
+		}
+	}
+	cancel()
+	if e := <-done; e != nil {
+		t.Fatal(e)
+	}
+	if tunnel == "" {
+		t.Fatal("reverse tunnel was not started")
+	}
+	if !strings.Contains(tunnel, "ServerAliveInterval=") || !strings.Contains(tunnel, "ServerAliveCountMax=") {
+		t.Fatal("reverse tunnel has no SSH keepalive:", tunnel)
+	}
+}

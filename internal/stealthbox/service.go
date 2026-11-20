@@ -202,13 +202,19 @@ func BridgeService(parent context.Context, c Config, log io.Writer) error {
 		finish()
 		cmd := sshCommand(c.Workspace.Host, "", false)
 		cmd.Args = cmd.Args[:len(cmd.Args)-1]
-		cmd.Args = append([]string{"-N", "-o", "ExitOnForwardFailure=yes", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
+		// Keepalives end ssh -N on a dead network path (sleep, Wi-Fi/VPN change),
+		// so the loop reconnects instead of holding a silent tunnel for hours.
+		cmd.Args = append([]string{"-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", c.Bridge.RemoteSocket + ":" + c.Bridge.Socket}, cmd.Args...)
 		fmt.Fprintln(log, "Connecting Mac bridge to", c.Workspace.Host)
+		connected := time.Now()
 		err = ExecuteContext(ctx, cmd, nil, io.Discard, log)
 		if ctx.Err() != nil {
 			return nil
 		}
-		fmt.Fprintln(log, "Check the reverse SSH error above; verify the VM binary is current and check for another active bridge.")
+		fmt.Fprintf(log, "Reverse SSH ended: %v. Check the error above; verify the VM binary is current and check for another active bridge.\n", err)
+		if time.Since(connected) > time.Minute {
+			delay = time.Second
+		}
 		if err = pause(ctx, delay, log); err != nil {
 			return nil
 		}
