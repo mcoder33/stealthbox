@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func sourceTestConfig(t *testing.T) Config {
@@ -243,5 +245,53 @@ func TestSourcePreviewRejectsPlanInsideCheckout(t *testing.T) {
 		if _, err := os.Stat(plan); !os.IsNotExist(err) {
 			t.Fatal("preview wrote plan into checkout")
 		}
+	}
+}
+
+// A lock left by a crashed apply must not block; a lock held by a running apply must.
+func TestSourceApplyLockFollowsItsHolder(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync unavailable")
+	}
+	c := sourceTestConfig(t)
+	cache := t.TempDir()
+	t.Setenv("HOME", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	writeSourceFile(t, c.Workspace.VMRoot, "team/repo/file", "vm")
+	identified := c
+	if err := EnsureWorkspaceIdentity(&identified); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := sourceApplyLockPath(identified, "team/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(filepath.Dir(lockFile), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(lockFile, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	preview := func() string {
+		plan := filepath.Join(t.TempDir(), "plan.json")
+		if err := PreviewSourceSync(context.Background(), c, "export", "team/repo", false, plan, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		return plan
+	}
+	if err = ApplySourceSync(context.Background(), c, preview(), &bytes.Buffer{}); err != nil {
+		t.Fatal("stale lock blocked apply:", err)
+	}
+	holder, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err = unix.Flock(int(holder.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	writeSourceFile(t, c.Workspace.VMRoot, "team/repo/file", "vm-changed")
+	if err = ApplySourceSync(context.Background(), c, preview(), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "another apply") {
+		t.Fatal("held lock did not block apply:", err)
 	}
 }

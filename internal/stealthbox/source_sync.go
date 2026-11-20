@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 type SourceEntry struct {
@@ -539,6 +541,16 @@ func sourceSyncCommand(c Config, plan SourceSyncPlan) (Command, error) {
 	return command, nil
 }
 
+// sourceApplyLockPath names the local lock shared by applies of one workspace checkout.
+func sourceApplyLockPath(c Config, path string) (string, error) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256([]byte(c.Workspace.ID + ":" + path))
+	return filepath.Join(cache, "stealthbox", "source-locks", fmt.Sprintf("%x.lock", hash[:])), nil
+}
+
 func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer) error {
 	if err := validateSourceSyncConfig(c); err != nil {
 		return err
@@ -585,22 +597,22 @@ func ApplySourceSync(ctx context.Context, c Config, planFile string, w io.Writer
 	if path != plan.RelativePath {
 		return fmt.Errorf("source plan path must be canonical")
 	}
-	cache, err := os.UserCacheDir()
+	lockFile, err := sourceApplyLockPath(c, path)
 	if err != nil {
 		return err
 	}
-	lockDir := filepath.Join(cache, "stealthbox", "source-locks")
-	if err = os.MkdirAll(lockDir, 0700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(lockFile), 0700); err != nil {
 		return err
 	}
-	hash := sha256.Sum256([]byte(c.Workspace.ID + ":" + path))
-	lockFile := filepath.Join(lockDir, fmt.Sprintf("%x.lock", hash[:]))
-	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	// The kernel releases flock when the holder exits, so a crashed apply leaves no lock.
+	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("source apply lock exists; another apply may be running: %w", err)
+		return err
 	}
-	lock.Close()
-	defer os.Remove(lockFile)
+	defer lock.Close()
+	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fmt.Errorf("another apply of this checkout is running: %w", err)
+	}
 	source, destination, err := sourceSyncStates(ctx, c, path, plan.Direction)
 	if err != nil {
 		return err
