@@ -171,6 +171,10 @@ func SyncSnapshot(root string, r io.Reader, max int64) error {
 	if err := validateRunnerRoot(root); err != nil {
 		return err
 	}
+	backup := root + ".stealthbox-old"
+	if err := discardInterruptedBackup(backup); err != nil {
+		return err
+	}
 	stage, err := os.MkdirTemp(filepath.Dir(root), ".stealthbox-stage-")
 	if err != nil {
 		return err
@@ -222,11 +226,6 @@ func SyncSnapshot(root string, r io.Reader, max int64) error {
 			return err
 		}
 	}
-	backup := root + ".stealthbox-old"
-	if _, e := os.Lstat(backup); !os.IsNotExist(e) {
-		restore()
-		return fmt.Errorf("backup path already exists: %s", backup)
-	}
 	if err = os.Rename(root, backup); err != nil {
 		restore()
 		return err
@@ -235,6 +234,23 @@ func SyncSnapshot(root string, r io.Reader, max int64) error {
 		_ = os.Rename(backup, root)
 		restore()
 		return err
+	}
+	return os.RemoveAll(backup)
+}
+
+// discardInterruptedBackup removes the previous runner tree left by a sync that
+// stopped during the swap. The runner tree is disposable: preserved caches and
+// the runner marker always move into the new tree before the swap.
+func discardInterruptedBackup(backup string) error {
+	info, err := os.Lstat(backup)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("runner backup path is not a directory: %s", backup)
 	}
 	return os.RemoveAll(backup)
 }

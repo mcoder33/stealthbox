@@ -315,3 +315,33 @@ func TestBridgeKeepsUTF8SplitAcrossWrites(t *testing.T) {
 		t.Fatalf("stdout = %q", stdout)
 	}
 }
+
+// A sync that stopped after moving the previous tree aside must not block later syncs.
+func TestArchiveSyncRecoversFromInterruptedSwap(t *testing.T) {
+	for _, rootSurvived := range []bool{true, false} {
+		src := canonicalTemp(t)
+		root := filepath.Join(canonicalTemp(t), "runner")
+		_ = os.WriteFile(src+"/code", []byte("current"), 0600)
+		if e := SyncSnapshot(root, snapshotFor(t, src), 1<<20); e != nil {
+			t.Fatal(e)
+		}
+		backup := root + ".stealthbox-old"
+		if rootSurvived {
+			if e := os.MkdirAll(backup, 0700); e != nil {
+				t.Fatal(e)
+			}
+			_ = os.WriteFile(backup+"/code", []byte("previous"), 0600)
+		} else if e := os.Rename(root, backup); e != nil {
+			t.Fatal(e)
+		}
+		if e := SyncSnapshot(root, snapshotFor(t, src), 1<<20); e != nil {
+			t.Fatal(rootSurvived, e)
+		}
+		if b, e := os.ReadFile(root + "/code"); e != nil || string(b) != "current" {
+			t.Fatal(rootSurvived, string(b), e)
+		}
+		if _, e := os.Lstat(backup); !os.IsNotExist(e) {
+			t.Fatal(rootSurvived, "interrupted backup survived", e)
+		}
+	}
+}
