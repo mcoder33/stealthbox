@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -240,6 +241,9 @@ func managedMCPInstance(ctx context.Context, c Config, configPath string) (manag
 		return managedMCPState{}, err
 	}
 	defer directory.Close()
+	if err := verifyManagedMCPExecutable(bin); err != nil {
+		return managedMCPState{}, err
+	}
 	current, err := Load(config)
 	if err != nil {
 		return managedMCPState{}, err
@@ -353,6 +357,26 @@ func (l *managedMCPStartupListener) Accept() (net.Conn, error) {
 		l.lock = nil
 	}
 	return l.TCPListener.Accept()
+}
+
+func verifyManagedMCPExecutable(executable string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	// On the VM setup replaces the binary by rename. os.Executable returns
+	// the pathname even when this process is still executing the old inode.
+	running, err := os.Stat("/proc/self/exe")
+	if err != nil {
+		return err
+	}
+	installed, err := os.Stat(executable)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(running, installed) {
+		return fmt.Errorf("Stealth Box executable changed during MCP startup; retry the agent launch")
+	}
+	return nil
 }
 
 func verifyManagedMCPGeneration(c Config, generation string) error {
