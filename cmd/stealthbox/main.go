@@ -26,6 +26,9 @@ func main() {
 	defer cancel()
 	if err := run(ctx, os.Args[1:]); err != nil {
 		if errors.Is(err, context.Canceled) {
+			if errors.Is(err, stealthbox.ErrSessionOutcomeUnknown) {
+				fmt.Fprintln(os.Stderr, "stealthbox:", err)
+			}
 			os.Exit(130)
 		}
 		fmt.Fprintln(os.Stderr, "stealthbox:", err)
@@ -76,6 +79,9 @@ func run(ctx context.Context, args []string) error {
 	if args[0] == "handshake" {
 		fmt.Println(stealthbox.Handshake())
 		return nil
+	}
+	if args[0] == "session" || args[0] == "session-vm" {
+		return runSessionCommand(ctx, args[1:], def, args[0] == "session-vm")
 	}
 	if strings.HasPrefix(args[0], "--") {
 		args = append([]string{"connect"}, args...)
@@ -602,7 +608,7 @@ func usage() {
   stealthbox config [--edit]          Show redacted config or edit with EDITOR
   stealthbox list                     List workspace and optional named profiles
   stealthbox list --discover          Discover checkout paths under Projects
-  stealthbox source import|export --path REL --plan FILE [--delete]
+` + sessionUsage + `  stealthbox source import|export --path REL --plan FILE [--delete]
                                      Preview local → VM / VM → local transfer; source files stay unchanged
   stealthbox source apply --plan FILE Apply reviewed plan only if both sides are unchanged
   stealthbox mcp                      MCP stdio tools (used automatically by Codex/Claude)
