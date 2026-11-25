@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -29,6 +28,11 @@ func startMCPHTTPFixture(t *testing.T, c Config) mcpHTTPFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startMCPHTTPOnListener(t, c, ln)
+}
+
+func startMCPHTTPOnListener(t *testing.T, c Config, ln net.Listener) mcpHTTPFixture {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	key := bytes.Repeat([]byte{0x83}, 32)
 	done := make(chan error, 1)
@@ -211,6 +215,46 @@ func TestMCPHTTPTransportBoundaries(t *testing.T) {
 	}
 }
 
+func TestMCPHTTPSessionHeadersAndMessages(t *testing.T) {
+	f := startMCPHTTPFixture(t, bridgeConfig(t))
+	token := f.bearer(MCPScope{Project: "test", Runner: "vm"})
+	session := f.initialize(token)
+	const ping = `{"jsonrpc":"2.0","id":2,"method":"ping"}`
+	for _, test := range []struct {
+		name   string
+		header string
+		values []string
+		status int
+	}{
+		{name: "no protocol header defaults to session", header: mcpProtocolHeader, status: http.StatusOK},
+		{name: "unsupported protocol on discovery", header: mcpProtocolHeader, values: []string{"2026-07-28"}, status: http.StatusBadRequest},
+		{name: "protocol differs from session", header: mcpProtocolHeader, values: []string{"2025-06-18"}, status: http.StatusBadRequest},
+		{name: "duplicate session header", header: mcpSessionHeader, values: []string{session, session}, status: http.StatusBadRequest},
+		{name: "duplicate authorization", header: "Authorization", values: []string{"Bearer " + token, "Bearer " + token}, status: http.StatusUnauthorized},
+		{name: "duplicate origin", header: "Origin", values: []string{f.url, f.url}, status: http.StatusForbidden},
+		{name: "application json accepts utf8 parameter", header: "Content-Type", values: []string{"application/json; charset=utf-8"}, status: http.StatusOK},
+		{name: "plain text body rejected", header: "Content-Type", values: []string{"text/plain"}, status: http.StatusUnsupportedMediaType},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := f.request(context.Background(), http.MethodPost, mcpHTTPPath, token, session, ping)
+			req.Header.Del(test.header)
+			for _, value := range test.values {
+				req.Header.Add(test.header, value)
+			}
+			f.exchange(req, test.status)
+		})
+	}
+	for _, body := range []string{
+		mcpHTTPInitialize,
+		`{"jsonrpc":"2.0","id":null,"method":"ping"}`,
+		`{"jsonrpc":"1.0","id":2,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":2}`,
+		"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"\xff\"}",
+	} {
+		f.post(token, session, body, http.StatusBadRequest)
+	}
+}
+
 func TestMCPHTTPSessionsDoNotConsumeIdleCapacity(t *testing.T) {
 	c := bridgeConfig(t)
 	f := startMCPHTTPFixture(t, c)
@@ -234,6 +278,7 @@ func TestMCPHTTPCancelsOnlyMatchingSession(t *testing.T) {
 	req := f.request(context.Background(), http.MethodPost, "/mcp", token, first, mcpHTTPWaitCommand)
 	done := mcpHTTPStatusAsync(f.http, req)
 	waitForMCPHTTPProcess(t, marker)
+	f.post(token, first, mcpHTTPWaitCommand, http.StatusBadRequest)
 	notify := `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"same"}}`
 	f.post(token, second, notify, http.StatusAccepted)
 	select {
@@ -325,6 +370,21 @@ func TestMCPHTTPCommandTimeout(t *testing.T) {
 	}
 }
 
+func TestMCPHTTPReadTimeoutDoesNotCancelSilentCall(t *testing.T) {
+	t.Parallel()
+	c := bridgeConfig(t)
+	c.Bridge.TimeoutSeconds = 20
+	f := startMCPHTTPFixture(t, c)
+	f.http.Timeout = 25 * time.Second
+	token := f.bearer(MCPScope{Project: "test", Runner: "vm"})
+	session := f.initialize(token)
+	const call = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vm_exec","arguments":{"argv":["sh","-c","sleep 12; printf finished"]}}}`
+	body := f.post(token, session, call, http.StatusOK)
+	if !strings.Contains(body, "finished") || !strings.Contains(body, `"isError":false`) {
+		t.Fatal(body)
+	}
+}
+
 func TestMCPHTTPAllowsBridgeQueueAndExecutionBudgets(t *testing.T) {
 	c := bridgeConfig(t)
 	c.Bridge.TimeoutSeconds = 1
@@ -368,7 +428,12 @@ func TestMCPHTTPAllowsBridgeQueueAndExecutionBudgets(t *testing.T) {
 
 func TestMCPHTTPSlowReaderCannotHoldResponse(t *testing.T) {
 	c := bridgeConfig(t)
-	f := startMCPHTTPFixture(t, c)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan string, 4)
+	f := startMCPHTTPOnListener(t, c, &mcpHTTPCloseObserver{Listener: listener, closed: closed})
 	token := f.bearer(MCPScope{Project: "test", Runner: "vm"})
 	session := f.initialize(token)
 	const output = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vm_exec","arguments":{"argv":["head","-c","1048576","/dev/zero"]}}}`
@@ -391,16 +456,53 @@ func TestMCPHTTPSlowReaderCannotHoldResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/json" {
 		t.Fatalf("slow request response headers: %#v", res)
 	}
 	// Start a separate request while the original client holds the response unread.
 	f.post(token, session, `{"jsonrpc":"2.0","id":3,"method":"ping"}`, http.StatusOK)
-	time.Sleep(mcpHTTPWriteTimeout + 200*time.Millisecond)
-	if n, err := io.Copy(io.Discard, res.Body); n >= 6<<20 || !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("slow response should have ended at its write deadline, read %d bytes: %v", n, err)
+	// Wait for the server to close the keep-alive connection after the stalled
+	// response. TCP may still have unread bytes on the client after this point.
+	deadline := time.NewTimer(mcpHTTPWriteTimeout + 2*time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case peer := <-closed:
+			if peer == conn.LocalAddr().String() {
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("server did not release the slow response at its write deadline")
+		}
 	}
+}
+
+type mcpHTTPCloseObserver struct {
+	net.Listener
+	closed chan<- string
+}
+
+func (l *mcpHTTPCloseObserver) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &mcpHTTPObservedConn{Conn: conn, closed: l.closed}, nil
+}
+
+type mcpHTTPObservedConn struct {
+	net.Conn
+	closed chan<- string
+}
+
+func (c *mcpHTTPObservedConn) Close() error {
+	peer := c.RemoteAddr().String()
+	err := c.Conn.Close()
+	select {
+	case c.closed <- peer:
+	default:
+	}
+	return err
 }
 
 func TestMCPCappedBufferCapsBridgeStringWrites(t *testing.T) {

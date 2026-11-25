@@ -38,6 +38,11 @@ type mcpCallKey struct {
 	request string
 }
 
+type mcpHTTPSession struct {
+	id       string
+	protocol string
+}
+
 type mcpHTTPServer struct {
 	config    Config
 	key       []byte
@@ -117,10 +122,7 @@ func mcpHTTPBridgeTimeout(c Config) time.Duration {
 
 func (s *mcpHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	address, _, _ := net.SplitHostPort(r.RemoteAddr)
-	origin := r.Header.Values("Origin")
-	if !net.ParseIP(address).IsLoopback() || r.Host != s.host ||
-		(len(origin) != 0 && (len(origin) != 1 || origin[0] != "http://"+s.host)) {
+	if !s.fromLoopback(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -128,27 +130,30 @@ func (s *mcpHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.health(w, r)
 		return
 	}
-	authorization := r.Header.Values("Authorization")
-	if len(authorization) != 1 {
-		mcpHTTPUnauthorized(w)
-		return
-	}
-	client, ok := s.authenticate(authorization[0])
+	client, ok := s.authenticate(r.Header.Values("Authorization"))
 	if !ok {
 		mcpHTTPUnauthorized(w)
 		return
 	}
-	switch r.URL.Path {
-	case mcpHTTPPath:
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.post(w, r, client)
-	default:
+	if r.URL.Path != mcpHTTPPath {
 		http.NotFound(w, r)
+		return
 	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.post(w, r, client)
+}
+
+func (s *mcpHTTPServer) fromLoopback(r *http.Request) bool {
+	address, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if !net.ParseIP(address).IsLoopback() || r.Host != s.host {
+		return false
+	}
+	origin := r.Header.Values("Origin")
+	return len(origin) == 0 || (len(origin) == 1 && origin[0] == "http://"+s.host)
 }
 
 func (s *mcpHTTPServer) health(w http.ResponseWriter, r *http.Request) {
@@ -172,47 +177,57 @@ func mcpHTTPUnauthorized(w http.ResponseWriter) {
 }
 
 func (s *mcpHTTPServer) post(w http.ResponseWriter, r *http.Request, client mcpHTTPClient) {
-	protocolHeader := r.Header.Values(mcpProtocolHeader)
+	session, ok := s.requestSession(w, r.Header, client)
+	if !ok {
+		return
+	}
+	req, ok := s.readRequest(w, r)
+	if !ok {
+		return
+	}
+	s.dispatch(w, r.Context(), client, session, req)
+}
+
+func (s *mcpHTTPServer) requestSession(w http.ResponseWriter, header http.Header, client mcpHTTPClient) (mcpHTTPSession, bool) {
+	var session mcpHTTPSession
+	protocolHeader := header.Values(mcpProtocolHeader)
 	if len(protocolHeader) > 1 || (len(protocolHeader) == 1 && !mcpHTTPSupports(protocolHeader[0])) {
 		http.Error(w, "unsupported MCP protocol version", http.StatusBadRequest)
-		return
+		return session, false
 	}
-	sessionHeader := r.Header.Values(mcpSessionHeader)
+	sessionHeader := header.Values(mcpSessionHeader)
+	if len(sessionHeader) == 0 {
+		return session, true
+	}
 	if len(sessionHeader) > 1 {
 		http.Error(w, "multiple MCP session IDs", http.StatusBadRequest)
-		return
+		return session, false
 	}
-	session := r.Header.Get(mcpSessionHeader)
-	var protocol string
-	if len(sessionHeader) == 1 {
-		protocol = s.sessionProtocol(client, session)
-		if protocol == "" {
-			http.Error(w, "MCP session expired or unknown", http.StatusNotFound)
-			return
-		}
-		if len(protocolHeader) == 1 && protocolHeader[0] != protocol {
-			http.Error(w, "protocol version differs from MCP session", http.StatusBadRequest)
-			return
-		}
+	session.id = sessionHeader[0]
+	session.protocol = s.sessionProtocol(client, session.id)
+	if session.protocol == "" {
+		http.Error(w, "MCP session expired or unknown", http.StatusNotFound)
+		return session, false
 	}
-	req, status, err := s.readRequest(w, r)
-	if err != nil {
-		http.Error(w, err.Error(), status)
-		return
+	if len(protocolHeader) == 1 && protocolHeader[0] != session.protocol {
+		http.Error(w, "protocol version differs from MCP session", http.StatusBadRequest)
+		return session, false
 	}
+	return session, true
+}
+
+func (s *mcpHTTPServer) dispatch(w http.ResponseWriter, ctx context.Context, client mcpHTTPClient, session mcpHTTPSession, req mcpRequest) {
 	id := mcpID(req.ID)
-	if req.Method == "initialize" && session == "" && id != "" {
-		protocol := mcpProtocol(req.Params, mcpHTTPProtocol)
-		w.Header().Set(mcpSessionHeader, s.mintSession(client, protocol))
-		writeMCPHTTPResponse(w, dispatchMCP(r.Context(), s.config, client.MCPScope, req, protocol, 0))
+	if session.id == "" {
+		s.initialize(w, ctx, client, req, id)
 		return
 	}
-	if session == "" || req.Method == "initialize" {
+	if req.Method == "initialize" {
 		http.Error(w, "initialize a new MCP session first", http.StatusBadRequest)
 		return
 	}
 	if len(req.ID) == 0 {
-		s.notify(session, req)
+		s.notify(session.id, req)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -221,10 +236,20 @@ func (s *mcpHTTPServer) post(w http.ResponseWriter, r *http.Request, client mcpH
 		return
 	}
 	if req.Method != "tools/call" {
-		writeMCPHTTPResponse(w, dispatchMCP(r.Context(), s.config, client.MCPScope, req, protocol, 0))
+		writeMCPHTTPResponse(w, dispatchMCP(ctx, s.config, client.MCPScope, req, session.protocol, 0))
 		return
 	}
-	s.callTool(w, r.Context(), client.MCPScope, mcpCallKey{session: session, request: id}, req)
+	s.callTool(w, ctx, client.MCPScope, mcpCallKey{session: session.id, request: id}, req)
+}
+
+func (s *mcpHTTPServer) initialize(w http.ResponseWriter, ctx context.Context, client mcpHTTPClient, req mcpRequest, id string) {
+	if req.Method != "initialize" || id == "" {
+		http.Error(w, "initialize a new MCP session first", http.StatusBadRequest)
+		return
+	}
+	protocol := mcpProtocol(req.Params, mcpHTTPProtocol)
+	w.Header().Set(mcpSessionHeader, s.mintSession(client, protocol))
+	writeMCPHTTPResponse(w, dispatchMCP(ctx, s.config, client.MCPScope, req, protocol, 0))
 }
 
 func mcpHTTPSupports(protocol string) bool {
@@ -236,33 +261,44 @@ func mcpHTTPSupports(protocol string) bool {
 	}
 }
 
-func (s *mcpHTTPServer) readRequest(w http.ResponseWriter, r *http.Request) (mcpRequest, int, error) {
+func (s *mcpHTTPServer) readRequest(w http.ResponseWriter, r *http.Request) (mcpRequest, bool) {
 	var req mcpRequest
 	contentType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if contentType != "application/json" {
-		return req, http.StatusUnsupportedMediaType, errors.New("MCP POST requires application/json")
+		http.Error(w, "MCP POST requires application/json", http.StatusUnsupportedMediaType)
+		return req, false
 	}
 	if r.ContentLength > mcpHTTPMaxBody {
-		return req, http.StatusRequestEntityTooLarge, errors.New("MCP request body exceeds its size limit")
+		http.Error(w, "MCP request body exceeds its size limit", http.StatusRequestEntityTooLarge)
+		return req, false
 	}
 	select {
 	case s.reading <- struct{}{}:
 		defer func() { <-s.reading }()
 	default:
-		return req, http.StatusServiceUnavailable, errors.New("MCP HTTP request reader is busy")
+		http.Error(w, "MCP HTTP request reader is busy", http.StatusServiceUnavailable)
+		return req, false
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, mcpHTTPMaxBody))
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
-		return req, http.StatusRequestEntityTooLarge, errors.New("MCP request body exceeds its size limit")
+		http.Error(w, "MCP request body exceeds its size limit", http.StatusRequestEntityTooLarge)
+		return req, false
 	}
 	if err != nil {
-		return req, http.StatusBadRequest, errors.New("could not read MCP request body")
+		http.Error(w, "could not read MCP request body", http.StatusBadRequest)
+		return req, false
 	}
+	return decodeMCPHTTPRequest(w, data)
+}
+
+func decodeMCPHTTPRequest(w http.ResponseWriter, data []byte) (mcpRequest, bool) {
+	var req mcpRequest
 	if !utf8.Valid(data) || json.Unmarshal(data, &req) != nil || req.JSONRPC != "2.0" || req.Method == "" {
-		return req, http.StatusBadRequest, errors.New("invalid MCP JSON-RPC message")
+		http.Error(w, "invalid MCP JSON-RPC message", http.StatusBadRequest)
+		return req, false
 	}
-	return req, 0, nil
+	return req, true
 }
 
 func mcpID(id json.RawMessage) string {

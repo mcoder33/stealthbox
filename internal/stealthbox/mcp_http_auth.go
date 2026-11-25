@@ -54,9 +54,12 @@ func (scope MCPScope) validHTTPBinding() bool {
 	return nameRE.MatchString(scope.Project) && nameRE.MatchString(scope.Runner)
 }
 
-func (s *mcpHTTPServer) authenticate(authorization string) (mcpHTTPClient, bool) {
+func (s *mcpHTTPServer) authenticate(authorization []string) (mcpHTTPClient, bool) {
 	var client mcpHTTPClient
-	scheme, token, _ := strings.Cut(authorization, " ")
+	if len(authorization) != 1 {
+		return client, false
+	}
+	scheme, token, _ := strings.Cut(authorization[0], " ")
 	if !strings.EqualFold(scheme, "Bearer") {
 		return client, false
 	}
