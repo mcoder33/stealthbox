@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -128,6 +129,7 @@ func (app *codexSessionApp) call(method string, params map[string]any, result an
 }
 
 func (app *codexSessionApp) readResult(method string, id int, result any) error {
+	expectedID := strconv.Itoa(id)
 	for {
 		var frame struct {
 			ID     json.RawMessage `json:"id"`
@@ -140,10 +142,13 @@ func (app *codexSessionApp) readResult(method string, id int, result any) error 
 		if err := app.output.Decode(&frame); err != nil {
 			return app.transportError(method, err)
 		}
-		if frame.Method != "" && codexHasValue(frame.ID) {
-			return fmt.Errorf("Codex app-server requires interactive handling for %s", frame.Method)
+		if frame.Method != "" {
+			if codexHasValue(frame.ID) {
+				return fmt.Errorf("Codex app-server requires interactive handling for %s", frame.Method)
+			}
+			continue
 		}
-		if string(frame.ID) != fmt.Sprint(id) || frame.Method != "" {
+		if string(frame.ID) != expectedID {
 			continue
 		}
 		if frame.Error != nil {
@@ -151,9 +156,6 @@ func (app *codexSessionApp) readResult(method string, id int, result any) error 
 		}
 		if len(frame.Result) == 0 {
 			return fmt.Errorf("empty Codex app-server response to %s", method)
-		}
-		if result == nil {
-			return nil
 		}
 		return json.Unmarshal(frame.Result, result)
 	}

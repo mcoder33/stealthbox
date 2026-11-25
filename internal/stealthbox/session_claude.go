@@ -114,11 +114,19 @@ func askClaudeSession(ctx context.Context, c Config, id, message string) (string
 	return exchangeClaudeMessage(ctx, target.PID, addr, message)
 }
 
+type claudeEnvelope struct {
+	Version int    `json:"msgV"`
+	Type    string `json:"type"`
+	From    string `json:"from"`
+}
+
+func claudeUserEnvelope(socket string) claudeEnvelope {
+	return claudeEnvelope{Version: 1, Type: "user", From: "uds:" + socket}
+}
+
 type claudeMessage struct {
-	Version  int    `json:"msgV"`
+	claudeEnvelope
 	ID       string `json:"msg_id,omitempty"`
-	Type     string `json:"type"`
-	From     string `json:"from"`
 	Priority string `json:"priority,omitempty"`
 	Message  struct {
 		Role    string `json:"role"`
@@ -154,21 +162,8 @@ func exchangeClaudeMessage(ctx context.Context, pid int, addr, message string) (
 	stopSend := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stopSend()
 	packet := newClaudeQuestion(replyPath, message)
-	frame, err := json.Marshal(packet)
-	if err != nil {
+	if err := packet.send(ctx, socket); err != nil {
 		return "", err
-	}
-	if len(frame) > 1_000_000 {
-		return "", fmt.Errorf("message exceeds the Claude peer inbox frame limit")
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if _, err := conn.Write(append(frame, '\n')); err != nil {
-		return "", fmt.Errorf("%w: write to Claude inbox: %w", ErrSessionOutcomeUnknown, err)
-	}
-	if err := socket.CloseWrite(); err != nil {
-		return "", fmt.Errorf("%w: close Claude inbox write side: %w", ErrSessionOutcomeUnknown, err)
 	}
 	answer, err := receiveClaudeAnswer(ctx, listener, pid, addr, packet.ID)
 	if err != nil {
@@ -177,12 +172,36 @@ func exchangeClaudeMessage(ctx context.Context, pid int, addr, message string) (
 	return answer, nil
 }
 
+func (packet claudeMessage) send(ctx context.Context, socket *net.UnixConn) error {
+	frame, err := json.Marshal(packet)
+	if err != nil {
+		return err
+	}
+	if len(frame) > 1_000_000 {
+		return fmt.Errorf("message exceeds the Claude peer inbox frame limit")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := socket.Write(append(frame, '\n')); err != nil {
+		return fmt.Errorf("%w: write to Claude inbox: %w", ErrSessionOutcomeUnknown, err)
+	}
+	if err := socket.CloseWrite(); err != nil {
+		return fmt.Errorf("%w: close Claude inbox write side: %w", ErrSessionOutcomeUnknown, err)
+	}
+	return nil
+}
+
 func newClaudeQuestion(replyPath, message string) claudeMessage {
 	var key [16]byte
 	rand.Read(key[:])
 	key[6] = key[6]&15 | 64
 	key[8] = key[8]&63 | 128
-	packet := claudeMessage{Version: 1, ID: fmt.Sprintf("%x-%x-%x-%x-%x", key[0:4], key[4:6], key[6:8], key[8:10], key[10:]), Type: "user", From: "uds:" + replyPath, Priority: "next"}
+	packet := claudeMessage{
+		claudeEnvelope: claudeUserEnvelope(replyPath),
+		ID:             fmt.Sprintf("%x-%x-%x-%x-%x", key[0:4], key[4:6], key[6:8], key[8:10], key[10:]),
+		Priority:       "next",
+	}
 	packet.Message.Role = "user"
 	// Script senders have no Claude permission class. The destination applies
 	// its own inbound controls to this message, including hold and refuse.
@@ -230,7 +249,7 @@ func decodeClaudeAnswer(r io.Reader, addr, id string) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(r, 4<<20)).Decode(&packet); err != nil {
 		return "", err
 	}
-	if packet.Type != "user" || packet.Version != 1 || packet.From != "uds:"+addr || packet.Message.Role != "user" {
+	if packet.claudeEnvelope != claudeUserEnvelope(addr) || packet.Message.Role != "user" {
 		return "", nil
 	}
 	header, body, found := strings.Cut(packet.Message.Content, ">\n")

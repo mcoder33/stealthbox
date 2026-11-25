@@ -3,7 +3,9 @@ package stealthbox
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -50,5 +52,27 @@ func TestSessionVMRefusesAnIncompleteMessage(t *testing.T) {
 	err := cmd.RunOnVM(t.Context(), Config{}, strings.NewReader(`{"message":"partial`), &stdout, &diagnostics)
 	if err == nil || !strings.Contains(err.Error(), "incomplete or invalid VM session request") || stdout.Len() != 0 {
 		t.Fatalf("error=%v, stdout=%q", err, stdout.String())
+	}
+}
+
+func TestSessionVMDispatchesToAnExistingCodexSession(t *testing.T) {
+	config, _, rollout := codexSessionFixture(t, "answer")
+	cmd := SessionCommand{Target: "codex:" + codexTestID, Timeout: 5 * time.Second}
+	message := "Проверь diff.\nЭто уточнение.\n"
+	request := JSONString(sessionMessage{Message: message})
+	var stdout, diagnostics bytes.Buffer
+	if err := cmd.RunOnVM(t.Context(), config, strings.NewReader(request), &stdout, &diagnostics); err != nil {
+		t.Fatal(err)
+	}
+
+	var reply sessionReply
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if want := (sessionReply{Agent: "codex", ID: codexTestID, Answer: "correlated answer"}); reply != want {
+		t.Fatalf("reply = %#v, want %#v", reply, want)
+	}
+	if queued, err := os.ReadFile(rollout + ".queued"); err != nil || string(queued) != message {
+		t.Fatalf("queued = %q, error = %v", queued, err)
 	}
 }

@@ -163,22 +163,30 @@ func (rollout *codexRollout) trackItem(event codexRolloutEvent, clientID string)
 	case item.Type == "UserMessage" && item.ClientID == clientID:
 		rollout.matchedTurn = event.Turn
 	case item.Type == "AgentMessage" && rollout.matchedTurn != "" && event.Turn == rollout.matchedTurn:
-		var content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(item.Content, &content); err != nil {
+		text, err := item.agentText()
+		if err != nil {
 			return err
 		}
-		var text strings.Builder
-		for _, part := range content {
-			if part.Type == "Text" {
-				text.WriteString(part.Text)
-			}
-		}
-		rollout.trackAgentMessage(item.Phase, text.String(), item.Moderation, true)
+		rollout.trackAgentMessage(item.Phase, text, item.Moderation, true)
 	}
 	return nil
+}
+
+func (item codexRolloutItem) agentText() (string, error) {
+	var content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(item.Content, &content); err != nil {
+		return "", err
+	}
+	var text strings.Builder
+	for _, part := range content {
+		if part.Type == "Text" {
+			text.WriteString(part.Text)
+		}
+	}
+	return text.String(), nil
 }
 
 func (rollout *codexRollout) trackAgentMessage(phase, text string, moderation json.RawMessage, hasTurnID bool) {

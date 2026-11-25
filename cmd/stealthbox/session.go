@@ -64,7 +64,10 @@ func parseSessionCommand(args []string, configDefault string) (stealthbox.Sessio
 	default:
 		return cmd, "", fmt.Errorf("unknown session action %q; use session list or session ask", action)
 	}
+	return parseSessionOptions(action, flags, configDefault, cmd)
+}
 
+func parseSessionOptions(action string, flags []string, configDefault string, cmd stealthbox.SessionCommand) (stealthbox.SessionCommand, string, error) {
 	f := flag.NewFlagSet("session "+action, flag.ContinueOnError)
 	f.SetOutput(io.Discard)
 	config := f.String("config", configDefault, "configuration path")

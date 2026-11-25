@@ -31,6 +31,18 @@ func TestCodexSessionAskCorrelatesOriginalTurn(t *testing.T) {
 	}
 }
 
+func TestCodexSessionTwoAsksReturnTheirOwnAnswers(t *testing.T) {
+	c, _, _ := codexSessionFixture(t, "sequence")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, message := range []string{"first follow-up", "second follow-up"} {
+		answer, err := askCodexSession(ctx, c, codexTestID, message)
+		if want := "answer to " + message; err != nil || answer != want {
+			t.Fatalf("ask %q = %q, %v; want %q", message, answer, err, want)
+		}
+	}
+}
+
 func TestCodexSessionListUsesLiveWriterAndScope(t *testing.T) {
 	c, home, _ := codexSessionFixture(t, "answer")
 	stale := "0188bcdd-3178-7c58-a226-27f3ea4f1fbc"
@@ -48,6 +60,38 @@ func TestCodexSessionListUsesLiveWriterAndScope(t *testing.T) {
 	}
 	if _, err = askCodexSession(context.Background(), c, codexTestID, "disallowed"); err == nil {
 		t.Fatal("out-of-scope ask succeeded")
+	}
+}
+
+func TestCodexSessionListSkipsUnavailableThreads(t *testing.T) {
+	for _, outcome := range []string{"missing-while-read", "lock-disappeared", "missing-rollout", "subagent"} {
+		t.Run(outcome, func(t *testing.T) {
+			c, _, _ := codexSessionFixture(t, outcome)
+			sessions, err := listCodexSessions(t.Context(), c)
+			if err != nil || len(sessions) != 0 {
+				t.Fatalf("sessions = %#v, err = %v", sessions, err)
+			}
+		})
+	}
+}
+
+func TestCodexSessionListWithNoWriterDirectory(t *testing.T) {
+	c, home, _ := codexSessionFixture(t, "answer")
+	if err := os.Rename(filepath.Join(home, "thread-writer-locks"), filepath.Join(home, "old-locks")); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := listCodexSessions(t.Context(), c)
+	if err != nil || len(sessions) != 0 {
+		t.Fatalf("sessions = %#v, err = %v", sessions, err)
+	}
+}
+
+func TestCodexSessionListPreservesRPCError(t *testing.T) {
+	c, _, _ := codexSessionFixture(t, "read-unsupported")
+	_, err := listCodexSessions(t.Context(), c)
+	var rejected codexSessionRPCRejected
+	if !errors.As(err, &rejected) || rejected.Method != "thread/read" || rejected.Code != -32601 {
+		t.Fatalf("read rejection = %v", err)
 	}
 }
 
@@ -101,6 +145,70 @@ func TestCodexSessionRejectsBusyAndReportsUnknown(t *testing.T) {
 			t.Fatalf("lost reply err = %v", err)
 		}
 	})
+}
+
+func TestCodexSessionAskDoesNotQueueBehindPendingWork(t *testing.T) {
+	c, _, rollout := codexSessionFixture(t, "queued")
+	_, err := askCodexSession(t.Context(), c, codexTestID, "must stay unsent")
+	if err == nil || !strings.Contains(err.Error(), "pending messages") || errors.Is(err, ErrSessionOutcomeUnknown) {
+		t.Fatalf("ask with pending work = %v", err)
+	}
+	if _, err := os.Stat(rollout + ".queued"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending session accepted a second message, sentinel err = %v", err)
+	}
+}
+
+func TestCodexSessionAskChecksLatestTurnDirectory(t *testing.T) {
+	c, _, rollout := codexSessionFixture(t, "answer")
+	appendCodexFixture(t, rollout, []any{map[string]any{
+		"type": "turn_context", "payload": map[string]string{"cwd": t.TempDir()},
+	}})
+	_, err := askCodexSession(t.Context(), c, codexTestID, "must stay inside the workspace")
+	if err == nil || !strings.Contains(err.Error(), "unavailable in this VM workspace") {
+		t.Fatalf("ask outside latest turn directory = %v", err)
+	}
+	if _, err := os.Stat(rollout + ".queued"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("out-of-scope ask queued message, sentinel err = %v", err)
+	}
+}
+
+func TestCodexSessionRolloutContinuesSplitRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	writer, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	rollout, err := openCodexRollout(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollout.file.Close()
+	if _, err := writer.WriteString(`{"type":"event_msg","payload":{"type":"task_started",`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollout.read(t.Context(), ""); err != nil || rollout.activeTurn != "" {
+		t.Fatalf("partial turn = %q, err = %v", rollout.activeTurn, err)
+	}
+	if _, err := writer.WriteString(`"turn_id":"next"}}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollout.read(t.Context(), ""); err != nil || rollout.activeTurn != "next" {
+		t.Fatalf("joined turn = %q, err = %v", rollout.activeTurn, err)
+	}
+}
+
+func TestCodexSessionAskPreservesQueueRejection(t *testing.T) {
+	c, _, rollout := codexSessionFixture(t, "queue-rejected")
+	_, err := askCodexSession(t.Context(), c, codexTestID, "known rejection")
+	var rejected codexSessionRPCRejected
+	if !errors.As(err, &rejected) || rejected.Method != "thread/queue/add" || rejected.Code != -32600 ||
+		errors.Is(err, ErrSessionOutcomeUnknown) {
+		t.Fatalf("queue rejection = %v", err)
+	}
+	if _, err := os.Stat(rollout + ".queued"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected message was queued, sentinel err = %v", err)
+	}
 }
 
 func TestCodexSessionParallelRequestCannotPostTwice(t *testing.T) {
@@ -224,6 +332,14 @@ func codexFixtureEvent(kind, turn string) map[string]any {
 	return map[string]any{"type": "event_msg", "payload": map[string]any{"type": kind, "turn_id": turn}}
 }
 
+func writeCodexFixtureFrame(t *testing.T, encoder *json.Encoder, frame map[string]any) {
+	t.Helper()
+	if err := encoder.Encode(frame); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+}
+
 func TestCodexSessionFixture(t *testing.T) {
 	rollout := os.Getenv("STEALTHBOX_TEST_CODEX_ROLLOUT")
 	if rollout == "" {
@@ -247,6 +363,10 @@ func TestCodexSessionFixture(t *testing.T) {
 		}
 		var result any = struct{}{}
 		outcome := os.Getenv("STEALTHBOX_TEST_CODEX_OUTCOME")
+		if outcome == "sequence" && request.ID != 0 {
+			writeCodexFixtureFrame(t, encoder, map[string]any{"id": request.ID + 100, "error": map[string]int{"code": -32600}})
+			writeCodexFixtureFrame(t, encoder, map[string]any{"method": "thread/status/changed"})
+		}
 		switch request.Method {
 		case "initialize":
 			result = map[string]any{"codexHome": os.Getenv("STEALTHBOX_TEST_CODEX_HOME")}
@@ -257,13 +377,36 @@ func TestCodexSessionFixture(t *testing.T) {
 				"id": request.Params.Thread, "name": "Original", "source": "cli",
 				"cwd": os.Getenv("STEALTHBOX_TEST_CODEX_PROJECT"), "path": rollout,
 			}
-			if outcome == "fork" {
+			switch outcome {
+			case "fork":
 				thread["forkedFromId"] = "0188bcdd-3178-7c58-a226-27f3ea4f1fbc"
+			case "subagent":
+				thread["source"] = map[string]any{"subAgent": "other"}
+			case "missing-rollout":
+				thread["path"] = rollout + ".missing"
+			case "lock-disappeared":
+				if err := os.Remove(codexWriterLock(os.Getenv("STEALTHBOX_TEST_CODEX_HOME"), request.Params.Thread)); err != nil {
+					t.Fatal(err)
+				}
+			case "missing-while-read":
+				writeCodexFixtureFrame(t, encoder, map[string]any{"id": request.ID, "error": map[string]int{"code": -32600}})
+				continue
+			case "read-unsupported":
+				writeCodexFixtureFrame(t, encoder, map[string]any{"id": request.ID, "error": map[string]int{"code": -32601}})
+				continue
 			}
 			result = map[string]any{"thread": thread}
 		case "thread/queue/list":
-			result = map[string]any{"data": []string{}}
+			data := []map[string]string{}
+			if outcome == "queued" {
+				data = append(data, map[string]string{"id": "pending-user-message"})
+			}
+			result = map[string]any{"data": data}
 		case "thread/queue/add":
+			if outcome == "queue-rejected" {
+				writeCodexFixtureFrame(t, encoder, map[string]any{"id": request.ID, "error": map[string]int{"code": -32600}})
+				continue
+			}
 			if len(request.Params.Input) != 1 || request.Params.Client == "" {
 				t.Fatal("bad queue input")
 			}
@@ -277,19 +420,19 @@ func TestCodexSessionFixture(t *testing.T) {
 			if outcome == "pending" {
 				break
 			}
-			appendCodexFixture(t, rollout, codexFixtureReply(outcome, request.Params.Client))
+			appendCodexFixture(t, rollout, codexFixtureReply(outcome, request.Params.Client, request.Params.Input[0].Text))
 		default:
 			t.Fatalf("unexpected RPC %s", request.Method)
 		}
-		if err := encoder.Encode(map[string]any{"id": request.ID, "result": result}); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
+		writeCodexFixtureFrame(t, encoder, map[string]any{"id": request.ID, "result": result})
 	}
 }
 
-func codexFixtureReply(outcome, clientID string) []any {
-	const text = "correlated answer"
+func codexFixtureReply(outcome, clientID, message string) []any {
+	text, turnID := "correlated answer", "ours"
+	if outcome == "sequence" {
+		text, turnID = "answer to "+message, clientID
+	}
 	phase := "final_answer"
 	if outcome == "commentary" {
 		phase = "commentary"
@@ -302,9 +445,9 @@ func codexFixtureReply(outcome, clientID string) []any {
 		answer["moderation"] = map[string]any{"moderated": true}
 	}
 	user := map[string]any{"type": "UserMessage", "client_id": clientID}
-	userEvent := map[string]any{"type": "item_completed", "turn_id": "ours", "item": user}
-	agentEvent := map[string]any{"type": "item_completed", "turn_id": "ours", "item": answer}
-	terminal := map[string]any{"type": "task_complete", "turn_id": "ours", "last_agent_message": text}
+	userEvent := map[string]any{"type": "item_completed", "turn_id": turnID, "item": user}
+	agentEvent := map[string]any{"type": "item_completed", "turn_id": turnID, "item": answer}
+	terminal := map[string]any{"type": "task_complete", "turn_id": turnID, "last_agent_message": text}
 	switch outcome {
 	case "legacy", "legacy-unconfirmed":
 		userEvent = map[string]any{"type": "user_message", "client_id": clientID}
@@ -320,8 +463,11 @@ func codexFixtureReply(outcome, clientID string) []any {
 	return []any{
 		codexFixtureEvent("task_started", "other"),
 		codexFixtureEvent("task_complete", "other"),
-		codexFixtureEvent("task_started", "ours"),
+		codexFixtureEvent("task_started", turnID),
 		map[string]any{"type": "event_msg", "payload": userEvent},
+		map[string]any{"type": "event_msg", "payload": map[string]any{
+			"type": "item_completed", "turn_id": "other", "item": map[string]any{"type": "AgentMessage", "content": "irrelevant"},
+		}},
 		map[string]any{"type": "event_msg", "payload": agentEvent},
 		map[string]any{"type": "event_msg", "payload": terminal},
 	}

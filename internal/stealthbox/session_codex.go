@@ -93,7 +93,10 @@ func codexLiveThreadIDs(home string) ([]string, error) {
 	return ids, nil
 }
 
-func (thread codexSessionThread) activeRollout(home string) (string, error) {
+func (thread codexSessionThread) scopedRollout(c Config, home string) (string, error) {
+	if !thread.interactive() || !sessionInScope(c, thread.CWD) {
+		return "", errors.New("Codex session is unavailable in this VM workspace")
+	}
 	root, err := filepath.EvalSymlinks(home)
 	if err != nil {
 		return "", err
@@ -139,10 +142,7 @@ func (app *codexSessionApp) visibleSession(c Config, id string) (VMSession, erro
 		}
 		return VMSession{}, err
 	}
-	if !thread.interactive() || !sessionInScope(c, thread.CWD) {
-		return VMSession{}, nil
-	}
-	if _, err := thread.activeRollout(app.home); err != nil {
+	if _, err := thread.scopedRollout(c, app.home); err != nil {
 		return VMSession{}, nil
 	}
 	live, err := codexWriterIsLive(codexWriterLock(app.home, id))
@@ -173,10 +173,7 @@ func (app *codexSessionApp) askExisting(c Config, lock, id, message string) (str
 	if err != nil {
 		return "", err
 	}
-	if !thread.interactive() || !sessionInScope(c, thread.CWD) {
-		return "", errors.New("Codex session is unavailable in this VM workspace")
-	}
-	path, err := thread.activeRollout(app.home)
+	path, err := thread.scopedRollout(c, app.home)
 	if err != nil {
 		return "", err
 	}

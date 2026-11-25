@@ -140,7 +140,7 @@ func TestClaudeAnswerRequiresTargetEnvelope(t *testing.T) {
 		{"blank final", func(p *claudeMessage) { p.Message.Content = strings.Replace(valid, "my answer", "  ", 1) }, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			p := claudeMessage{Version: 1, Type: "user", From: "uds:" + addr}
+			p := claudeMessage{claudeEnvelope: claudeEnvelope{Version: 1, Type: "user", From: "uds:" + addr}}
 			p.Message.Role = "user"
 			p.Message.Content = valid
 			tt.alter(&p)
@@ -153,5 +153,46 @@ func TestClaudeAnswerRequiresTargetEnvelope(t *testing.T) {
 				t.Fatalf("decode = %q, %v; want %q", got, err, tt.want)
 			}
 		})
+	}
+}
+
+func TestClaudeInboxRequiresLiveRegistrationAndSocket(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	identity := claudeSessionIdentity{ID: "example", CWD: home, PID: 42, StartedAt: 100}
+	registration := claudeSession{claudeSessionIdentity: identity, Socket: filepath.Join(home, "inbox.sock")}
+	path := filepath.Join(dir, "42.json")
+	if _, err := registration.inbox(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing registration: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var malformed *json.SyntaxError
+	if _, err := registration.inbox(); !errors.As(err, &malformed) {
+		t.Fatalf("partial registration: %v", err)
+	}
+
+	data, err := json.Marshal(registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registration.inbox(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing socket: %v", err)
+	}
+	if err := os.WriteFile(registration.Socket, []byte("regular file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if addr, err := registration.inbox(); err == nil || addr != "" {
+		t.Fatalf("regular file returned as inbox: %q, %v", addr, err)
 	}
 }
