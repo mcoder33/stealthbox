@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -110,7 +111,9 @@ func TestManagedAgentTimeoutCoversBridgeQueueAndOperation(t *testing.T) {
 
 func TestManagedMCPLifetimeLockProtectsEndpointReplacement(t *testing.T) {
 	c := sourceTestConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	repo := canonicalTemp(t)
+	c.Projects["repo"] = Project{Source: Endpoint{Path: repo}, Runners: map[string]Endpoint{"vm": {Path: repo}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "state", "endpoint.json")
 	directory, err := lockManagedMCPDirectory(ctx, filepath.Dir(path))
@@ -128,8 +131,10 @@ func TestManagedMCPLifetimeLockProtectsEndpointReplacement(t *testing.T) {
 		lease.Close()
 		done <- err
 	}()
+	var instance managedMCPState
 	for {
 		if state, ready := readyManagedMCPInstance(ctx, path, "first"); ready && state.PID == os.Getpid() {
+			instance = state
 			break
 		}
 		select {
@@ -146,6 +151,61 @@ func TestManagedMCPLifetimeLockProtectsEndpointReplacement(t *testing.T) {
 	if second, err := acquireManagedMCPDaemon(short, path, "first"); err == nil {
 		second.Close()
 		t.Fatal("healthy daemon shared its lifetime lock with a second owner")
+	}
+	fixture := mcpHTTPFixture{t: t, url: instance.url(), key: instance.Key, http: &http.Client{Timeout: 8 * time.Second}}
+	defer fixture.http.CloseIdleConnections()
+	bearer := fixture.bearer(MCPScope{Runner: "vm", Project: "repo"})
+	fixture.exchange(fixture.request(ctx, http.MethodPost, mcpHTTPRetirePath, bearer, "", ""), http.StatusUnauthorized)
+	session := fixture.initialize(bearer)
+	markerDir := t.TempDir()
+	started, release := filepath.Join(markerDir, "started"), filepath.Join(markerDir, "release")
+	defer os.WriteFile(release, nil, 0600)
+	command := "touch " + Quote(started) + "; while [ ! -f " + Quote(release) + " ]; do sleep .02; done; printf completed"
+	params := map[string]any{"name": "runner_run", "arguments": map[string]any{"argv": []string{"sh", "-c", command}}}
+	body := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":` + JSONString(params) + `}`
+	request := fixture.request(ctx, http.MethodPost, "/mcp", bearer, session, body)
+	result := make(chan []byte, 1)
+	go func() {
+		response, err := fixture.http.Do(request)
+		if err != nil {
+			result <- nil
+			return
+		}
+		defer response.Body.Close()
+		content, _ := io.ReadAll(response.Body)
+		result <- content
+	}()
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		select {
+		case early := <-result:
+			t.Fatalf("tool call returned before starting: %s", early)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if replacement, err := acquireManagedMCPDaemon(ctx, path, "next"); err == nil || !strings.Contains(err.Error(), "busy") {
+		if replacement != nil {
+			replacement.Close()
+		}
+		t.Fatalf("active tool call did not block replacement: %v", err)
+	}
+	if state, ready := readyManagedMCPInstance(ctx, path, "first"); !ready || state.Port != instance.Port {
+		t.Fatal("busy replacement changed the live endpoint")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case output := <-result:
+		if !strings.Contains(string(output), "completed") || strings.Contains(string(output), `"isError":true`) {
+			t.Fatalf("live tool call did not finish after attempted replacement: %s", output)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	// A different generation retires the endpoint before obtaining the lock.
 	replacement, err := acquireManagedMCPDaemon(ctx, path, "next")

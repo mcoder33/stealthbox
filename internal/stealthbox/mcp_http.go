@@ -19,6 +19,7 @@ import (
 
 const (
 	mcpHTTPPath          = "/mcp"
+	mcpHTTPRetirePath    = "/retire-idle"
 	mcpSessionHeader     = "MCP-Session-Id"
 	mcpProtocolHeader    = "MCP-Protocol-Version"
 	mcpHTTPProtocol      = "2025-11-25"
@@ -48,11 +49,13 @@ type mcpHTTPServer struct {
 	key       []byte
 	host      string
 	timeout   time.Duration
+	stop      context.CancelFunc
 	reading   chan struct{}
 	executing chan struct{}
 
-	mu     sync.Mutex
-	active map[mcpCallKey]context.CancelCauseFunc
+	mu      sync.Mutex
+	retired bool
+	active  map[mcpCallKey]context.CancelCauseFunc
 }
 
 // ServeMCPHTTP serves the MCP endpoint on an already-bound loopback TCP listener.
@@ -74,6 +77,7 @@ func ServeMCPHTTP(ctx context.Context, c Config, listener net.Listener, key []by
 		key:       bytes.Clone(key),
 		host:      addr.String(),
 		timeout:   timeout,
+		stop:      stop,
 		reading:   make(chan struct{}, mcpHTTPMaxReads),
 		executing: make(chan struct{}, mcpHTTPMaxCalls),
 		active:    make(map[mcpCallKey]context.CancelCauseFunc),
@@ -126,8 +130,12 @@ func (s *mcpHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if r.URL.Path == "/health" {
+	switch r.URL.Path {
+	case "/health":
 		s.health(w, r)
+		return
+	case mcpHTTPRetirePath:
+		s.retireIdle(w, r)
 		return
 	}
 	client, ok := s.authenticate(r.Header.Values("Authorization"))
@@ -169,6 +177,29 @@ func (s *mcpHTTPServer) health(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set(mcpHTTPProofHeader, mcpHTTPHealthProof(s.key, challenge[0]))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *mcpHTTPServer) retireIdle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := mcpAuthorizationToken(r.Header.Values("Authorization"))
+	if _, ok := verifyMCPHTTP(s.key, mcpRetireDomain, token); !ok {
+		mcpHTTPUnauthorized(w)
+		return
+	}
+	s.mu.Lock()
+	if len(s.active) != 0 {
+		s.mu.Unlock()
+		http.Error(w, "MCP service is busy", http.StatusConflict)
+		return
+	}
+	s.retired = true
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+	s.stop()
 }
 
 func mcpHTTPUnauthorized(w http.ResponseWriter) {
@@ -346,6 +377,11 @@ func (s *mcpHTTPServer) callTool(w http.ResponseWriter, ctx context.Context, sco
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		http.Error(w, "MCP service retired", http.StatusServiceUnavailable)
+		return
+	}
 	if _, running := s.active[key]; running {
 		s.mu.Unlock()
 		http.Error(w, "duplicate in-flight MCP request ID", http.StatusBadRequest)

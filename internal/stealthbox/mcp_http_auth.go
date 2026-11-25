@@ -15,6 +15,7 @@ const (
 	mcpBearerDomain        = "stealthbox:mcp:client"
 	mcpSessionDomain       = "stealthbox:mcp:session:"
 	mcpHealthDomain        = "stealthbox:mcp:health"
+	mcpRetireDomain        = "stealthbox:mcp:retire-idle"
 	mcpHTTPChallengeHeader = "X-Stealthbox-MCP-Challenge"
 	mcpHTTPProofHeader     = "X-Stealthbox-MCP-Proof"
 	mcpTokenMaxBytes       = 4096
@@ -54,15 +55,20 @@ func (scope MCPScope) validHTTPBinding() bool {
 	return nameRE.MatchString(scope.Project) && nameRE.MatchString(scope.Runner)
 }
 
-func (s *mcpHTTPServer) authenticate(authorization []string) (mcpHTTPClient, bool) {
-	var client mcpHTTPClient
+func mcpAuthorizationToken(authorization []string) string {
 	if len(authorization) != 1 {
-		return client, false
+		return ""
 	}
 	scheme, token, _ := strings.Cut(authorization[0], " ")
 	if !strings.EqualFold(scheme, "Bearer") {
-		return client, false
+		return ""
 	}
+	return token
+}
+
+func (s *mcpHTTPServer) authenticate(authorization []string) (mcpHTTPClient, bool) {
+	var client mcpHTTPClient
+	token := mcpAuthorizationToken(authorization)
 	payload, ok := verifyMCPHTTP(s.key, mcpBearerDomain, token)
 	if !ok || json.Unmarshal(payload, &client) != nil || client.ID == "" || !client.validHTTPBinding() {
 		return client, false

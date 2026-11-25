@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -46,8 +47,7 @@ func (s managedMCPState) ready(ctx context.Context) bool {
 	}
 	challenge := rand.Text()
 	request.Header.Set(mcpHTTPChallengeHeader, challenge)
-	transport := &http.Transport{DisableKeepAlives: true}
-	client := http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := managedMCPControlClient()
 	response, err := client.Do(request)
 	if err != nil {
 		return false
@@ -55,6 +55,38 @@ func (s managedMCPState) ready(ctx context.Context) bool {
 	response.Body.Close()
 	proof := response.Header.Get(mcpHTTPProofHeader)
 	return response.StatusCode == http.StatusNoContent && hmac.Equal([]byte(proof), []byte(mcpHTTPHealthProof(s.Key, challenge)))
+}
+
+func (s managedMCPState) retire(ctx context.Context) error {
+	probe, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probe, http.MethodPost, s.url()+mcpHTTPRetirePath, nil)
+	if err != nil {
+		return err
+	}
+	token := signMCPHTTP(s.Key, mcpRetireDomain, []byte(rand.Text()))
+	request.Header.Set("Authorization", "Bearer "+token)
+	client := managedMCPControlClient()
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("request idle MCP service replacement: %w", err)
+	}
+	response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusNoContent:
+		return nil
+	case http.StatusConflict:
+		return fmt.Errorf("MCP service is busy with active tool calls; wait for them to finish and retry")
+	default:
+		return fmt.Errorf("MCP service could not retire safely: HTTP %d", response.StatusCode)
+	}
+}
+
+func managedMCPControlClient() *http.Client {
+	return &http.Client{
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func managedMCPPaths(configPath string) (config, state string, err error) {
@@ -149,9 +181,8 @@ func lockManagedMCPFile(ctx context.Context, file *os.File) error {
 
 func acquireManagedMCPDaemon(ctx context.Context, statePath, generation string) (*os.File, error) {
 	state, err := readManagedMCPState(statePath)
-	if err != nil || state.Generation != generation {
-		// An incompatible or unreadable state tells the old owner to retire.
-		if err := os.Remove(statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err == nil && state.Generation != generation && state.ready(ctx) {
+		if err := state.retire(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -217,10 +248,19 @@ func startManagedMCPInstance(ctx context.Context, bin, config, statePath, genera
 		return managedMCPState{}, err
 	}
 	defer lease.Close()
+	startupLog, err := os.CreateTemp(filepath.Dir(statePath), ".mcp-start-*")
+	if err != nil {
+		return managedMCPState{}, err
+	}
+	defer startupLog.Close()
+	if err := os.Remove(startupLog.Name()); err != nil {
+		return managedMCPState{}, err
+	}
 	// The daemon inherits both locks. If the launcher dies during startup,
 	// the daemon can still finish publishing the only endpoint for this profile.
 	cmd := exec.Command(bin, "mcp-service", "--config", config, "--", generation)
 	cmd.Dir = filepath.Dir(config)
+	cmd.Stderr = startupLog
 	cmd.Env = append(sharedMCPServiceEnv(os.Environ()), "PATH="+managedPath(), "STEALTHBOX_CONFIG="+config)
 	cmd.ExtraFiles = []*os.File{directory, lease}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -235,7 +275,8 @@ func startManagedMCPInstance(ctx context.Context, bin, config, statePath, genera
 		}
 		select {
 		case err := <-done:
-			return managedMCPState{}, fmt.Errorf("MCP service exited during startup: %v", err)
+			detail, _ := io.ReadAll(io.NewSectionReader(startupLog, 0, 4096))
+			return managedMCPState{}, fmt.Errorf("MCP service exited during startup: %v (%s)", err, strings.TrimSpace(string(detail)))
 		case <-ctx.Done():
 			return managedMCPState{}, ctx.Err()
 		case <-time.After(25 * time.Millisecond):
@@ -276,10 +317,11 @@ func serveManagedMCP(ctx context.Context, c Config, statePath, generation string
 	if err != nil {
 		return err
 	}
+	defer os.Remove(statePath)
 	startupLock.Close()
 	serving, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go monitorManagedMCPState(serving, cancel, statePath, state)
+	go monitorManagedMCPState(serving, statePath, state)
 	return ServeMCPHTTP(serving, c, listener, state.Key)
 }
 
@@ -321,7 +363,7 @@ func publishManagedMCPState(path, generation string, port int) (managedMCPState,
 	return state, writePrivate(path, data)
 }
 
-func monitorManagedMCPState(ctx context.Context, stop context.CancelFunc, path string, published managedMCPState) {
+func monitorManagedMCPState(ctx context.Context, path string, published managedMCPState) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -330,8 +372,10 @@ func monitorManagedMCPState(ctx context.Context, stop context.CancelFunc, path s
 			return
 		case <-ticker.C:
 			state, err := readManagedMCPState(path)
-			if err != nil || state.PID != published.PID || state.Port != published.Port || !hmac.Equal(state.Key, published.Key) {
-				stop()
+			if err == nil && state.PID == published.PID && state.Port == published.Port && hmac.Equal(state.Key, published.Key) {
+				continue
+			}
+			if published.ready(ctx) && published.retire(ctx) == nil {
 				return
 			}
 		}
