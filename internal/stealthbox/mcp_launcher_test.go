@@ -55,6 +55,11 @@ func seedManagedMCP(t *testing.T, c Config, configPath string) {
 	if err := writePrivate(location, state); err != nil {
 		t.Fatal(err)
 	}
+	lease, err := acquireManagedMCPDaemon(context.Background(), location, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lease.Close() })
 }
 
 func TestManagedMCPRejectsReusedPortWithoutLeakingBearer(t *testing.T) {
@@ -218,5 +223,60 @@ func TestManagedMCPLifetimeLockProtectsEndpointReplacement(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("old endpoint remained published after retirement", err)
+	}
+}
+
+func TestManagedMCPStaleLauncherKeepsCurrentEndpoint(t *testing.T) {
+	stale := sourceTestConfig(t)
+	current := stale
+	current.Workspace.SourceExcludes = []string{"fixture"}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	seedManagedMCP(t, current, configPath)
+	_, path, err := managedMCPPaths(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := readManagedMCPState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := managedMCPInstance(ctx, stale, configPath); err == nil || !strings.Contains(err.Error(), "configuration changed") {
+		t.Fatalf("stale launcher was not rejected before replacement: %v", err)
+	}
+	if after, ready := readyManagedMCPInstance(context.Background(), path, before.Generation); !ready || after.Port != before.Port {
+		t.Fatal("stale launcher retired the current service")
+	}
+}
+
+func TestManagedMCPNamedLaunchDefaultsKeepCurrentEndpoint(t *testing.T) {
+	c := sourceTestConfig(t)
+	repo := canonicalTemp(t)
+	project := Project{Source: Endpoint{Path: repo}, Runners: map[string]Endpoint{"vm": {Path: repo}, "alternate": {Path: repo}}, Runner: "vm", Agent: "codex"}
+	c.Projects["repo"] = project
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	seedManagedMCP(t, c, configPath)
+	_, path, err := managedMCPPaths(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := readManagedMCPState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project.Agent, project.Runner = "claude", "alternate"
+	c.Projects["repo"] = project
+	if err := Save(configPath, c); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	after, err := managedMCPInstance(ctx, c, configPath)
+	if err != nil || after.Port != before.Port {
+		t.Fatalf("named project defaults replaced the service: %v", err)
+	}
+	if p := c.Projects["repo"]; p.Agent != "claude" || p.Runner != "alternate" {
+		t.Fatal("computing the service generation changed the caller's defaults")
 	}
 }

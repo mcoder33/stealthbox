@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -107,6 +108,9 @@ func managedMCPPaths(configPath string) (config, state string, err error) {
 }
 
 func managedMCPGeneration(c Config, executable string) (string, error) {
+	if err := NormalizeLocalWorkspaceRoots(&c); err != nil {
+		return "", err
+	}
 	info, err := os.Stat(executable)
 	if err != nil {
 		return "", err
@@ -115,6 +119,11 @@ func managedMCPGeneration(c Config, executable string) (string, error) {
 	// runner is part of the signed MCP scope.
 	c.Workspace.Runner = ""
 	c.Agents = nil
+	c.Projects = maps.Clone(c.Projects)
+	for name, project := range c.Projects {
+		project.Agent, project.Runner = "", ""
+		c.Projects[name] = project
+	}
 	if !c.Bridge.Enabled {
 		// Load supplies a temporary token for configurations without a Mac bridge.
 		c.Bridge.Token = ""
@@ -231,6 +240,13 @@ func managedMCPInstance(ctx context.Context, c Config, configPath string) (manag
 		return managedMCPState{}, err
 	}
 	defer directory.Close()
+	current, err := Load(config)
+	if err != nil {
+		return managedMCPState{}, err
+	}
+	if err := verifyManagedMCPGeneration(current, generation); err != nil {
+		return managedMCPState{}, err
+	}
 	if state, ready := readyManagedMCPInstance(ctx, statePath, generation); ready {
 		return state, nil
 	}
@@ -318,11 +334,25 @@ func serveManagedMCP(ctx context.Context, c Config, statePath, generation string
 		return err
 	}
 	defer os.Remove(statePath)
-	startupLock.Close()
 	serving, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go monitorManagedMCPState(serving, statePath, state)
-	return ServeMCPHTTP(serving, c, listener, state.Key)
+	return ServeMCPHTTP(serving, c, &managedMCPStartupListener{TCPListener: listener, lock: startupLock}, state.Key)
+}
+
+// Keep the startup lock until net/http enters its accept loop, even when the
+// original launcher stops waiting before the daemon is ready.
+type managedMCPStartupListener struct {
+	*net.TCPListener
+	lock *os.File
+}
+
+func (l *managedMCPStartupListener) Accept() (net.Conn, error) {
+	if l.lock != nil {
+		l.lock.Close()
+		l.lock = nil
+	}
+	return l.TCPListener.Accept()
 }
 
 func verifyManagedMCPGeneration(c Config, generation string) error {
@@ -332,7 +362,7 @@ func verifyManagedMCPGeneration(c Config, generation string) error {
 	}
 	current, err := managedMCPGeneration(c, bin)
 	if err != nil || current != generation {
-		return fmt.Errorf("MCP configuration changed during startup")
+		return fmt.Errorf("MCP configuration changed during startup; retry the agent launch")
 	}
 	return nil
 }
