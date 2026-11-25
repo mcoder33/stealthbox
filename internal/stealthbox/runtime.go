@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -27,6 +28,10 @@ func ExecuteNoninteractiveContext(ctx context.Context, c Command, stdin io.Reade
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	return runNoninteractiveCommand(ctx, cmd)
+}
+
+func runNoninteractiveCommand(ctx context.Context, cmd *exec.Cmd) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -144,7 +149,7 @@ func Guide(project, runner string) string {
 	return fmt.Sprintf(`Stealth Box environment: project=%s, default runner=%s.
 The agent and authoritative source code live on the VM. The Mac runner synchronizes uncommitted VM files into a disposable Mac checkout, executes there and returns output. Volumes and databases are not moved. Use mac_exec for explicit Mac tasks only when that tool is enabled. Mac commands execute with the Mac user's permissions, not in a security sandbox. Use vm_exec for explicit VM commands outside the runner workloads described below.`, project, runner) + workloadGuide + imageGuide
 }
-func AgentCommand(c Config, configPath, project, agent, runner string, extra []string) ([]string, error) {
+func AgentCommand(c Config, mcpURL, project, agent, runner string, extra []string) ([]string, error) {
 	args, ok := c.Agents[agent]
 	if !ok {
 		switch agent {
@@ -157,22 +162,31 @@ func AgentCommand(c Config, configPath, project, agent, runner string, extra []s
 		}
 	}
 	args = append([]string{}, args...)
-	if nativeAgentUtility(extra) {
+	if !usesManagedAgentMCP(agent, extra) {
 		return append(args, extra...), nil
 	}
-	bin, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	if agent == "codex" {
-		args = append(args, "-c", "mcp_servers.stealthbox.command="+JSONString(bin), "-c", "mcp_servers.stealthbox.args="+JSONString([]string{"mcp", "--config", configPath}), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_PROJECT="+JSONString(project), "-c", "mcp_servers.stealthbox.env.STEALTHBOX_RUNNER="+JSONString(runner),
-			"-c", "mcp_servers.stealthbox.env.STEALTHBOX_SCOPE="+JSONString(agentScope(c, project)),
-			"-c", fmt.Sprintf("mcp_servers.stealthbox.tool_timeout_sec=%d", pastedImageTransferTimeout/time.Second+15))
-	}
-	if agent == "claude" {
-		args = append(args, "--append-system-prompt", Guide(project, runner), "--mcp-config", JSONString(map[string]any{"mcpServers": map[string]any{"stealthbox": map[string]any{"command": bin, "args": []string{"mcp", "--config", configPath}, "env": map[string]string{"STEALTHBOX_PROJECT": project, "STEALTHBOX_RUNNER": runner, "STEALTHBOX_SCOPE": agentScope(c, project)}}}}))
+	timeout := mcpHTTPCallTimeout(c) + mcpHTTPReadTimeout + mcpHTTPWriteTimeout + 5*time.Second
+	switch agent {
+	case "codex":
+		server := fmt.Sprintf(`mcp_servers.stealthbox={url=%s,bearer_token_env_var=%s,tool_timeout_sec=%d}`,
+			JSONString(mcpURL), JSONString(managedMCPTokenEnv), timeout/time.Second)
+		args = append(args, "-c", server)
+	case "claude":
+		timeoutMS := timeout.Milliseconds()
+		if configured, err := strconv.ParseInt(os.Getenv("MCP_TOOL_TIMEOUT"), 10, 64); err == nil && configured > 0 {
+			timeoutMS = configured
+		}
+		server := map[string]any{"type": "http", "url": mcpURL, "timeout": timeoutMS, "headers": map[string]string{
+			"Authorization": "Bearer ${" + managedMCPTokenEnv + "}",
+		}}
+		args = append(args, "--append-system-prompt", Guide(project, runner), "--mcp-config",
+			JSONString(map[string]any{"mcpServers": map[string]any{"stealthbox": server}}))
 	}
 	return append(args, extra...), nil
+}
+
+func usesManagedAgentMCP(agent string, extra []string) bool {
+	return (agent == "codex" || agent == "claude") && !nativeAgentUtility(extra)
 }
 
 func nativeAgentUtility(extra []string) bool {

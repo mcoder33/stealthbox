@@ -396,6 +396,16 @@ func run(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("Local Mac bridge daemon: healthy; direct execution=%t. VM connectivity was not checked.\n", s.AllowExec)
 		return nil
+	case "mcp-service":
+		if *dry || len(f.Args()) != 1 {
+			return fmt.Errorf("mcp-service is started by the managed agent launcher")
+		}
+		return stealthbox.ManagedMCPService(ctx, c, *config, f.Args()[0])
+	case "agent-client":
+		if *dry || !visited["agent"] || !visited["runner"] || !visited["project"] {
+			return fmt.Errorf("agent-client is started by the managed workspace")
+		}
+		return stealthbox.ExecManagedAgent(ctx, c, *config, *project, *agent, *runner, f.Args())
 	case "mcp":
 		if *dry {
 			fmt.Println("Would start MCP stdio server")
@@ -605,7 +615,7 @@ func usage() {
   stealthbox source import|export --path REL --plan FILE [--delete]
                                      Preview local → VM / VM → local transfer; source files stay unchanged
   stealthbox source apply --plan FILE Apply reviewed plan only if both sides are unchanged
-  stealthbox mcp                      MCP stdio tools (used automatically by Codex/Claude)
+  stealthbox mcp                      MCP stdio tools for manual integrations
 
 All command flags precede -- and command arguments. --dry-run makes no changes.
 Config: STEALTHBOX_CONFIG or ~/.config/stealthbox/config.json.

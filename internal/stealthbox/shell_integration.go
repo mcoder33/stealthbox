@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 type workspaceLaunch struct {
@@ -90,28 +92,99 @@ func resolveWorkspaceLaunch(ctx context.Context, c Config, selector, agent, runn
 }
 
 func workspaceLaunchScript(c Config, configPath string, launch workspaceLaunch, extra []string) (string, error) {
-	cmd, err := AgentCommand(c, configPath, launch.binding, launch.agent, launch.runner, extra)
+	var cmd []string
+	var err error
+	switch {
+	case usesManagedAgentMCP(launch.agent, extra):
+		var bin string
+		bin, err = os.Executable()
+		if err == nil {
+			cmd = append([]string{bin, "agent-client", "--config", configPath, "--project", launch.binding,
+				"--agent", launch.agent, "--runner", launch.runner, "--"}, extra...)
+		}
+	case launch.scope == "workspace" && launch.agent == "shell" && c.Workspace.ShellIntegration:
+		cmd, err = managedShellCommand(c, extra)
+	default:
+		cmd, err = AgentCommand(c, "", launch.binding, launch.agent, launch.runner, extra)
+	}
 	if err != nil {
 		return "", err
 	}
-	if launch.scope == "workspace" && launch.agent == "shell" && c.Workspace.ShellIntegration {
-		cmd, err = managedShellCommand(c, extra)
-		if err != nil {
-			return "", err
-		}
+	env := workspaceLaunchEnv(c, configPath, launch)
+	for i, variable := range env {
+		name, value, _ := strings.Cut(variable, "=")
+		env[i] = name + "=" + Quote(value)
 	}
+	return "export " + strings.Join(env, " ") + "; exec " + shellArgs(cmd), nil
+}
+
+func workspaceLaunchEnv(c Config, configPath string, launch workspaceLaunch) []string {
 	runnerSource := "captured"
 	if launch.scope == "workspace" && launch.agent == "shell" && !launch.runnerPinned {
 		runnerSource = "default"
 	}
-	env := "export PATH=" + Quote(managedPath()) + " STEALTHBOX_CONFIG=" + Quote(configPath) + " STEALTHBOX_PROJECT=" + Quote(launch.binding) + " STEALTHBOX_SCOPE=" + Quote(launch.scope) + " STEALTHBOX_RUNNER=" + Quote(launch.runner) + " STEALTHBOX_RUNNER_SOURCE=" + Quote(runnerSource) + " STEALTHBOX_AGENT=" + Quote(launch.agent) + " STEALTHBOX_VM_ROOT=" + Quote(c.Workspace.VMRoot)
-	return env + "; exec " + shellArgs(cmd), nil
+	return []string{"PATH=" + managedPath(), "STEALTHBOX_CONFIG=" + configPath, "STEALTHBOX_PROJECT=" + launch.binding,
+		"STEALTHBOX_SCOPE=" + launch.scope, "STEALTHBOX_RUNNER=" + launch.runner, "STEALTHBOX_RUNNER_SOURCE=" + runnerSource,
+		"STEALTHBOX_AGENT=" + launch.agent, "STEALTHBOX_VM_ROOT=" + c.Workspace.VMRoot}
+}
+
+func prepareManagedAgent(ctx context.Context, c Config, configPath, project, agent, runner string, extra []string) (argv, environment []string, err error) {
+	scope := MCPScope{Project: project, Runner: runner, Workspace: agentScope(c, project) == "workspace"}
+	url, token, err := ensureManagedMCP(ctx, c, configPath, scope)
+	if err != nil {
+		return nil, nil, fmt.Errorf("start shared MCP service: %w", err)
+	}
+	argv, err = AgentCommand(c, url, project, agent, runner, extra)
+	return argv, managedMCPEnv(token), err
+}
+
+func managedMCPEnv(token string) []string {
+	local := []string{"127.0.0.1", "localhost"}
+	for _, name := range []string{"NO_PROXY", "no_proxy"} {
+		if value := os.Getenv(name); value != "" {
+			local = append(local, value)
+		}
+	}
+	noProxy := strings.Join(local, ",")
+	return []string{managedMCPTokenEnv + "=" + token, "NO_PROXY=" + noProxy, "no_proxy=" + noProxy}
+}
+
+// ExecManagedAgent replaces the tmux pane's bootstrap with the native client.
+func ExecManagedAgent(ctx context.Context, c Config, configPath, project, agent, runner string, extra []string) error {
+	if !usesManagedAgentMCP(agent, extra) {
+		return fmt.Errorf("managed MCP client requires an interactive Codex or Claude command")
+	}
+	argv, environment, err := prepareManagedAgent(ctx, c, configPath, project, agent, runner, extra)
+	if err != nil {
+		return err
+	}
+	// Resolve the native executable using the managed shell's PATH. Using an
+	// exec preserves the pane, signals and foreground terminal ownership.
+	for _, variable := range environment {
+		name, value, _ := strings.Cut(variable, "=")
+		if err := os.Setenv(name, value); err != nil {
+			return err
+		}
+	}
+	return syscall.Exec("/bin/sh", []string{"sh", "-c", "exec " + shellArgs(argv)}, os.Environ())
+}
+
+func runPlainManagedAgent(ctx context.Context, c Config, configPath string, launch workspaceLaunch, extra []string, stdout, stderr io.Writer) error {
+	argv, environment, err := prepareManagedAgent(ctx, c, configPath, launch.binding, launch.agent, launch.runner, extra)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "exec "+shellArgs(argv))
+	cmd.Dir = launch.directory
+	cmd.Env = append(append(os.Environ(), workspaceLaunchEnv(c, configPath, launch)...), environment...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
+	return cmd.Run()
 }
 
 // LaunchAgent is used inside the managed VM shell. It does not open another tmux.
 func LaunchAgent(ctx context.Context, c Config, configPath, selector, agent, runner string, extra []string, stdout, stderr io.Writer) error {
 	if nativeAgentUtility(extra) {
-		args, err := AgentCommand(c, configPath, "", agent, runner, extra)
+		args, err := AgentCommand(c, "", "", agent, runner, extra)
 		if err != nil {
 			return err
 		}

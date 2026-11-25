@@ -116,6 +116,7 @@ def main():
                        '    command: ["sh", "-c", "cat /src/code.txt; printf docker-ok"]\n')
             call(ssh + [f'cat > {VM_ROOT}/a/api/compose.yaml'], input=compose)
             mock = ('#!/bin/sh\n'
+                    'test -n "$STEALTHBOX_MCP_BEARER_TOKEN" || exit 91\n'
                     'printf "%s|%s|%s\\n" "$STEALTHBOX_SCOPE" "$STEALTHBOX_PROJECT" "$PWD" '
                     '>> /home/developer/agent-launches\n'
                     'printf "%s\\n" "$@" > /home/developer/agent-arguments\n')
@@ -257,6 +258,22 @@ def main():
             assert remote(REMOTE_BIN, 'run', '--config', REMOTE_CONFIG, '--path', 'plain/src/tests',
                           '--runner', 'local', '--', 'cat', '../../root-file') == 'nongit-root'
             print('PASS non-Git subdirectory uses the direct-child checkout and full source sync', flush=True)
+            profile_state = '/home/developer/.cache/stealthbox/mcp/*/endpoint.json'
+
+            def mcp_service():
+                state = json.loads(remote('sh', '-c', f'cat {profile_state}'))
+                running = remote('ps', '-p', str(state['PID']), '-o', 'args=').strip()
+                assert running.startswith(REMOTE_BIN + ' mcp-service '), running
+                return state['PID'], f"http://127.0.0.1:{state['Port']}/mcp"
+
+            codex = shlex.join([REMOTE_BIN, 'agent', 'codex', '--config', REMOTE_CONFIG, '--runner', 'vm', '--', '--cold-first'])
+            claude = shlex.join([REMOTE_BIN, 'agent', 'claude', '--config', REMOTE_CONFIG, '--runner', 'local', '--', '--cold-second'])
+            remote('sh', '-c', f'cd {VM_ROOT}; {codex} & first=$!; {claude} & second=$!; '
+                   'wait "$first" && wait "$second"')
+            shared_pid, shared_url = mcp_service()
+            processes = remote('ps', '-eo', 'args=').splitlines()
+            assert sum(line.strip().startswith(REMOTE_BIN + ' mcp-service ') for line in processes) == 1
+            print('PASS concurrent cold Codex + Claude launches share one MCP service', flush=True)
             root_window = remote('tmux', '-L', 'stealthbox', 'display-message', '-p', '-t', 'stealthbox', '#{window_id}').strip()
             remote('tmux', '-L', 'stealthbox', 'send-keys', '-t', root_window,
                    f'cd {VM_ROOT}/a/api; codex --fixture-first', 'Enter')
@@ -269,13 +286,18 @@ def main():
                                if 'workspace||' + VM_ROOT + '/b/api' in remote('cat', '/home/developer/agent-launches') else '')
             assert 'workspace||' + VM_ROOT + '/a/api' in launches and 'workspace||' + VM_ROOT + '/b/api' in launches
             args = remote('cat', '/home/developer/agent-arguments')
-            assert 'STEALTHBOX_SCOPE="workspace"' in args, args
-            print('PASS root tmux shell, ordinary new window, codex wrapper + workspace MCP arguments (mock launcher)', flush=True)
+            assert shared_url in args and 'bearer_token_env_var="STEALTHBOX_MCP_BEARER_TOKEN"' in args, args
+            assert mcp_service() == (shared_pid, shared_url)
+            print('PASS root tmux shell and ordinary new window inherit the shared workspace MCP', flush=True)
             pane = remote('tmux', '-L', 'stealthbox', 'split-window', '-h', '-P', '-F', '#{pane_id}',
                           '-t', 'stealthbox:second', '-c', f'{VM_ROOT}/b/api').strip()
             remote('tmux', '-L', 'stealthbox', 'send-keys', '-t', pane, 'claude --fixture-third', 'Enter')
             wait_for(lambda: '--fixture-third' in remote('cat', '/home/developer/agent-arguments'))
-            assert '--mcp-config' in remote('cat', '/home/developer/agent-arguments')
+            args = remote('cat', '/home/developer/agent-arguments').splitlines()
+            server = json.loads(args[args.index('--mcp-config') + 1])['mcpServers']['stealthbox']
+            assert server['type'] == 'http' and server['url'] == shared_url, server
+            assert server['headers']['Authorization'] == 'Bearer ${STEALTHBOX_MCP_BEARER_TOKEN}', server
+            assert mcp_service() == (shared_pid, shared_url)
             before = remote('tmux', '-L', 'stealthbox', 'display-message', '-p', '-t', 'stealthbox',
                             '#{window_id}|#{pane_id}|#{pane_pid}|#{session_windows}')
             remote('tmux', '-L', 'stealthbox', 'detach-client', '-s', 'stealthbox')

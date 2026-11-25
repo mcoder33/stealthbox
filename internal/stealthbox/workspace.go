@@ -53,6 +53,10 @@ func workspaceRemote(ctx context.Context, c Config, configPath, project, agent, 
 	if resume {
 		window = "shell"
 	}
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
 	environment, err := workspaceLaunchScript(c, configPath, launch, extra)
 	if err != nil {
 		return err
@@ -195,6 +199,9 @@ func PlainRemote(ctx context.Context, c Config, configPath, project, agent, runn
 	launch, err := resolveWorkspaceLaunch(ctx, c, project, agent, runner)
 	if err != nil {
 		return err
+	}
+	if usesManagedAgentMCP(launch.agent, extra) {
+		return runPlainManagedAgent(ctx, c, configPath, launch, extra, stdout, stderr)
 	}
 	script, err := workspaceLaunchScript(c, configPath, launch, extra)
 	if err != nil {

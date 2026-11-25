@@ -189,19 +189,7 @@ func TestWorkspaceMCPRoutesEachCheckoutAndPreservesBinding(t *testing.T) {
 	if !strings.Contains(out.String(), "bound to project foo") {
 		t.Fatal(out.String())
 	}
-	for _, agent := range []string{"codex", "claude"} {
-		args, err := AgentCommand(c, "/tmp/config.json", "foo", agent, "vm", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		joined := strings.Join(args, " ")
-		if agent == "codex" && !strings.Contains(joined, `STEALTHBOX_SCOPE="project"`) {
-			t.Fatal(joined)
-		}
-		if agent == "claude" && !strings.Contains(joined, `"STEALTHBOX_SCOPE":"project"`) {
-			t.Fatal(joined)
-		}
-	}
+
 }
 func TestVMExecutionRejectsCWDSymlinkEscape(t *testing.T) {
 	c := rootConfig(t)

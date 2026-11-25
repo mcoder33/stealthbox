@@ -8,9 +8,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 )
 
-func serveFile(w http.ResponseWriter, r *http.Request, c Config, locks *runnerLocks) {
+func serveFile(w http.ResponseWriter, r *http.Request, c Config, queue *runnerQueue) {
 	name := r.URL.Query().Get("project")
 	rel := r.URL.Query().Get("path")
 	resolved, err := resolveBridgeProject(r.Context(), c, RunRequest{Project: name, WorkspaceID: r.URL.Query().Get("workspace_id"), Path: r.URL.Query().Get("checkout")})
@@ -28,12 +29,12 @@ func serveFile(w http.ResponseWriter, r *http.Request, c Config, locks *runnerLo
 		http.Error(w, "Mac runner unavailable", 400)
 		return
 	}
-	lock := locks.forProject(resolved.ID)
-	if !lock.TryLock() {
+	release := queue.tryAcquire(filepath.Clean(dst.Path))
+	if release == nil {
 		http.Error(w, "runner is busy", 409)
 		return
 	}
-	defer lock.Unlock()
+	defer release()
 	root, err := os.OpenRoot(dst.Path)
 	if err != nil {
 		http.Error(w, "runner directory unavailable", 404)
@@ -51,14 +52,17 @@ func serveFile(w http.ResponseWriter, r *http.Request, c Config, locks *runnerLo
 		http.Error(w, "artifact must be a regular file", 400)
 		return
 	}
-	max, _ := limits(c)
+	max, timeout := limits(c)
 	if s.Size() > max {
 		http.Error(w, "artifact exceeds transfer limit", 413)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprint(s.Size()))
-	_, _ = io.CopyN(w, f, s.Size())
+	response := newBridgeResponse(w, time.Now().Add(timeout))
+	if _, err := io.CopyN(response, f, s.Size()); err == nil {
+		_ = response.flush()
+	}
 }
 func Fetch(ctx context.Context, c Config, project, rel, output string) error {
 	if !c.Bridge.Enabled {
