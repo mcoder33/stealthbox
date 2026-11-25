@@ -357,3 +357,149 @@ func TestBridgeQueueWaitPreservesExecutionBudget(t *testing.T) {
 		t.Fatal("queued command did not finish")
 	}
 }
+
+func TestBridgeQueueRemovesDisconnectedArchiveCaller(t *testing.T) {
+	c, runner, queue, server := queueTestBridge(t, 30)
+	if err := validateRunnerRoot(runner); err != nil {
+		t.Fatal(err)
+	}
+	source := c.Projects["test"].Source.Path
+	if err := os.WriteFile(filepath.Join(source, "received-from-archive"), []byte("snapshot"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	body := snapshotFor(t, source)
+	hold := queue.tryAcquire(runner)
+	defer func() {
+		if hold != nil {
+			hold()
+		}
+	}()
+	request := queueRunRequest(t, context.Background(), c, server.URL, RunRequest{
+		Project: "test", Sync: true, Args: []string{"touch", "unexpected-command"},
+	})
+	conn := queueRawRequest(t, server, request, fmt.Sprintf("Content-Length: %d\r\n", body.Len()))
+	if _, err := body.WriteTo(conn); err != nil {
+		t.Fatal(err)
+	}
+	waitForQueueTest(t, "archive request to enter queue", func() bool {
+		_, n := queueDepth(queue, runner)
+		return n == 1
+	})
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForQueueTest(t, "disconnected archive to leave while predecessor is active", func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		pending, occupied := queue.waiting[runner]
+		return occupied && len(pending) == 0 && queue.stagedArchives == 0 && queue.stagedBytes == 0
+	})
+
+	hold()
+	hold = nil
+	assertEmptyRunnerQueue(t, queue)
+	for _, name := range []string{"received-from-archive", "unexpected-command"} {
+		if _, err := os.Stat(filepath.Join(runner, name)); !os.IsNotExist(err) {
+			t.Fatalf("abandoned archive affected runner at %s: %v", name, err)
+		}
+	}
+}
+
+func TestBridgeQueuedArchiveRunsAfterPredecessor(t *testing.T) {
+	c, runner, queue, server := queueTestBridge(t, 30)
+	source := c.Projects["test"].Source.Path
+	if err := os.WriteFile(filepath.Join(source, "new-file"), []byte("from-archive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	body := snapshotFor(t, source)
+	hold := queue.tryAcquire(runner)
+	defer func() {
+		if hold != nil {
+			hold()
+		}
+	}()
+	request := queueRunRequest(t, context.Background(), c, server.URL, RunRequest{
+		Project: "test", Sync: true, Args: []string{"cat", "new-file"},
+	})
+	conn := queueRawRequest(t, server, request, fmt.Sprintf("Content-Length: %d\r\n", body.Len()))
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := body.WriteTo(conn); err != nil {
+		t.Fatal(err)
+	}
+	waitForQueueTest(t, "archive to reserve staging space and queue position", func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return len(queue.waiting[runner]) == 1 && queue.stagedBytes > 0
+	})
+	if _, err := os.Stat(filepath.Join(runner, "new-file")); !os.IsNotExist(err) {
+		t.Fatalf("archive changed active runner before its turn: %v", err)
+	}
+
+	hold()
+	hold = nil
+	response, err := http.ReadResponse(bufio.NewReader(conn), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	output, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(output), "from-archive") {
+		t.Fatalf("queued archive run = HTTP %d %q: %v", response.StatusCode, output, err)
+	}
+	assertEmptyRunnerQueue(t, queue)
+}
+
+func TestBridgeArchiveSilentCommandSurvivesIOIdleTimeout(t *testing.T) {
+	for _, mode := range []string{"direct", "queued"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			c, runner, queue, server := queueTestBridge(t, 15)
+			body := snapshotFor(t, c.Projects["test"].Source.Path)
+			// This padding is valid tar but exceeds net/http's opportunistic
+			// pre-response drain, so the handler must reach HTTP body EOF.
+			body.Write(make([]byte, 512<<10))
+			var hold func()
+			if mode == "queued" {
+				hold = queue.tryAcquire(runner)
+				defer func() {
+					if hold != nil {
+						hold()
+					}
+				}()
+			}
+			req := queueRunRequest(t, context.Background(), c, server.URL, RunRequest{
+				Project: "test", Sync: true, Args: []string{"sh", "-c", "sleep 7; echo completed"},
+			})
+			conn := queueRawRequest(t, server, req, fmt.Sprintf("Content-Length: %d\r\n", body.Len()))
+			if err := conn.SetDeadline(time.Now().Add(12 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := body.WriteTo(conn); err != nil {
+				t.Fatal(err)
+			}
+			if hold != nil {
+				waitForQueueTest(t, "archive to enter queue", func() bool {
+					_, waiting := queueDepth(queue, runner)
+					return waiting == 1
+				})
+				hold()
+				hold = nil
+			}
+			response, err := http.ReadResponse(bufio.NewReader(conn), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			data, err := io.ReadAll(response.Body)
+			if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(data), "completed") {
+				t.Fatalf("silent archive command = HTTP %d %q: %v", response.StatusCode, data, err)
+			}
+			if response.Close {
+				t.Fatal("HTTP body was left unread before the command response")
+			}
+			assertEmptyRunnerQueue(t, queue)
+		})
+	}
+}

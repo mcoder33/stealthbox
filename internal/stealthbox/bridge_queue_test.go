@@ -17,7 +17,7 @@ func beginRunnerWait(t *testing.T, queue *runnerQueue, runner string, depth int,
 	t.Helper()
 	done := make(chan runnerAdmission, 1)
 	go func() {
-		release, err := queue.acquire(ctx, runner)
+		release, err := queue.acquire(ctx, runner, nil)
 		done <- runnerAdmission{release, err}
 	}()
 	deadline := time.Now().Add(3 * time.Second)
@@ -117,15 +117,15 @@ func TestRunnerQueueBoundsAndExpiry(t *testing.T) {
 		for depth := 1; depth <= maxRunnerWaiters; depth++ {
 			waiters = append(waiters, beginRunnerWait(t, queue, runner, depth, ctx))
 		}
-		if _, err := queue.acquire(ctx, runner); !errors.Is(err, errRunnerQueueFull) {
+		if _, err := queue.acquire(ctx, runner, nil); !errors.Is(err, errRunnerQueueFull) {
 			t.Fatalf("runner capacity overflow: %v", err)
 		}
 	}
-	independent, err := queue.acquire(ctx, "extra")
+	independent, err := queue.acquire(ctx, "extra", nil)
 	if err != nil {
 		t.Fatalf("global queue capacity blocked an idle runner: %v", err)
 	}
-	if _, err := queue.acquire(ctx, "extra"); !errors.Is(err, errRunnerQueueFull) {
+	if _, err := queue.acquire(ctx, "extra", nil); !errors.Is(err, errRunnerQueueFull) {
 		t.Fatalf("global queue capacity overflow: %v", err)
 	}
 	independent()
@@ -143,7 +143,7 @@ func TestRunnerQueueBoundsAndExpiry(t *testing.T) {
 	release := queue.tryAcquire("runner")
 	deadline, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer stop()
-	if _, err := queue.acquire(deadline, "runner"); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := queue.acquire(deadline, "runner", nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("wait did not expire: %v", err)
 	}
 	release()
@@ -185,16 +185,40 @@ func TestRunnerQueueDropsUnusedRunners(t *testing.T) {
 	queue := &runnerQueue{waiting: make(map[string][]chan struct{})}
 	for i := 0; i < 1000; i++ {
 		runner := fmt.Sprintf("runner-%d", i)
-		release, err := queue.acquire(context.Background(), runner)
+		release, err := queue.acquire(context.Background(), runner, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if _, err := queue.acquire(ctx, runner); !errors.Is(err, context.Canceled) {
+		if _, err := queue.acquire(ctx, runner, nil); !errors.Is(err, context.Canceled) {
 			t.Fatalf("already canceled waiter acquired a runner: %v", err)
 		}
 		release()
+	}
+	assertEmptyRunnerQueue(t, queue)
+}
+
+func TestRunnerQueueBoundsStagedArchiveStorage(t *testing.T) {
+	queue := &runnerQueue{}
+	if !queue.reserveArchive(3, 5) || !queue.reserveArchive(2, 5) {
+		t.Fatal("archive reservation within byte budget rejected")
+	}
+	if queue.reserveArchive(1, 5) {
+		t.Fatal("archive storage exceeded its byte budget")
+	}
+	queue.releaseArchive(3)
+	queue.releaseArchive(2)
+	for range maxBridgeWaiters {
+		if !queue.reserveArchive(0, 5) {
+			t.Fatal("empty archive rejected within count budget")
+		}
+	}
+	if queue.reserveArchive(0, 5) {
+		t.Fatal("archive storage exceeded its count budget")
+	}
+	for range maxBridgeWaiters {
+		queue.releaseArchive(0)
 	}
 	assertEmptyRunnerQueue(t, queue)
 }
@@ -203,7 +227,7 @@ func assertEmptyRunnerQueue(t *testing.T, queue *runnerQueue) {
 	t.Helper()
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if len(queue.waiting) != 0 || queue.total != 0 {
-		t.Fatalf("queue leaked: %v, total=%d", queue.waiting, queue.total)
+	if len(queue.waiting) != 0 || queue.total != 0 || queue.stagedArchives != 0 || queue.stagedBytes != 0 {
+		t.Fatalf("queue leaked: %v, total=%d, archives=%d, bytes=%d", queue.waiting, queue.total, queue.stagedArchives, queue.stagedBytes)
 	}
 }

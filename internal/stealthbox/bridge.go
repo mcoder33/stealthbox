@@ -191,10 +191,27 @@ func serveBridgeRun(w http.ResponseWriter, r *http.Request, c Config, queue *run
 
 func runQueuedBridgeCommand(w http.ResponseWriter, r *http.Request, c Config, queue *runnerQueue, req RunRequest, resolved ResolvedProject, dst Endpoint, transport string) {
 	maxBytes, operationTimeout := limits(c)
+	var archive *queuedBridgeArchive
+	closeArchive := func() {
+		if archive != nil {
+			archive.close()
+			archive = nil
+		}
+	}
+	defer closeArchive()
 	waitCtx, finishWaiting := context.WithTimeout(r.Context(), operationTimeout)
-	release, err := queue.acquire(waitCtx, filepath.Clean(dst.Path))
+	defer finishWaiting()
+	release, err := queue.acquire(waitCtx, filepath.Clean(dst.Path), func() error {
+		if transport != "archive" {
+			return nil
+		}
+		var err error
+		archive, err = stageQueuedBridgeArchive(waitCtx, w, r, queue, maxBytes)
+		return err
+	})
 	finishWaiting()
 	if err != nil {
+		closeArchive()
 		writeRunnerQueueError(w, r, err)
 		return
 	}
@@ -203,12 +220,15 @@ func runQueuedBridgeCommand(w http.ResponseWriter, r *http.Request, c Config, qu
 	operationCtx, cancel := context.WithTimeout(r.Context(), operationTimeout)
 	defer cancel()
 	if err := operationCtx.Err(); err != nil {
+		closeArchive()
 		writeRunnerQueueError(w, r, err)
 		return
 	}
 	syncStatus := "not-requested"
 	if req.Sync {
-		if err := syncBridgeRunner(operationCtx, w, r, c, resolved.Project.Source, dst, transport, maxBytes); err != nil {
+		err := syncBridgeRunner(operationCtx, w, r, c, resolved.Project.Source, dst, transport, archive, maxBytes)
+		closeArchive()
+		if err != nil {
 			writeBridgeRunError(w, r, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -265,13 +285,18 @@ func bridgeSyncTransport(c Config, req RunRequest) (string, error) {
 }
 
 func writeRunnerQueueError(w http.ResponseWriter, r *http.Request, err error) {
+	var sizeError *http.MaxBytesError
 	switch {
-	case errors.Is(err, errRunnerQueueFull):
+	case errors.Is(err, errRunnerQueueFull), errors.Is(err, errBridgeArchiveStagingFull):
 		writeBridgeRunError(w, r, "execution=not_started: "+err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeBridgeRunError(w, r, "execution=not_started: runner queue wait expired", http.StatusRequestTimeout)
-	default:
+	case errors.Is(err, context.Canceled):
 		writeBridgeRunError(w, r, "execution=not_started: runner request canceled", http.StatusRequestTimeout)
+	case errors.As(err, &sizeError):
+		writeBridgeRunError(w, r, "execution=not_started: queued archive exceeds limit", http.StatusRequestEntityTooLarge)
+	default:
+		writeBridgeRunError(w, r, "execution=not_started: "+err.Error(), http.StatusBadRequest)
 	}
 }
 
@@ -284,15 +309,15 @@ func writeBridgeRunError(w http.ResponseWriter, r *http.Request, message string,
 	http.Error(w, message, status)
 }
 
-func syncBridgeRunner(ctx context.Context, w http.ResponseWriter, r *http.Request, c Config, src, dst Endpoint, transport string, maxBytes int64) error {
+func syncBridgeRunner(ctx context.Context, w http.ResponseWriter, r *http.Request, c Config, src, dst Endpoint, transport string, archive *queuedBridgeArchive, maxBytes int64) error {
 	if transport == "rsync" {
 		var diagnostic strings.Builder
 		return PullRunner(ctx, c, src, dst.Path, &diagnostic)
 	}
-	// Archive reads use both the operation deadline and an idle timeout.
-	// A stalled upload must finish unwinding before the next run can sync.
-	request := bridgeArchiveReader{ctx: ctx, control: http.NewResponseController(w), body: http.MaxBytesReader(w, r.Body, maxBytes+(64<<20))}
-	return SyncSnapshot(dst.Path, request, maxBytes)
+	if archive != nil {
+		return syncSnapshot(ctx, dst.Path, archive.file, maxBytes, false)
+	}
+	return syncSnapshot(ctx, dst.Path, bridgeArchiveRequest(ctx, w, r, archiveRequestLimit(maxBytes)), maxBytes, true)
 }
 
 func streamBridgeCommand(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, resolved ResolvedProject, argv []string, cwd, syncStatus, transport string) {
@@ -505,7 +530,7 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 		}
 		defer os.Remove(archive.Name())
 		defer archive.Close()
-		if err = Snapshot(p.Source.Path, archive, max); err != nil {
+		if err = snapshotContext(ctx, p.Source.Path, archive, max); err != nil {
 			return err
 		}
 		if _, err = archive.Seek(0, 0); err != nil {

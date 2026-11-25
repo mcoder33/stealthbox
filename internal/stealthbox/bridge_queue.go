@@ -17,12 +17,14 @@ var errRunnerQueueFull = errors.New("runner queue is full")
 // Each key represents an occupied runner and holds its waiting requests in
 // arrival order. Only the request holding the runner can hand it off.
 type runnerQueue struct {
-	mu      sync.Mutex
-	waiting map[string][]chan struct{}
-	total   int
+	mu             sync.Mutex
+	waiting        map[string][]chan struct{}
+	total          int
+	stagedArchives int
+	stagedBytes    int64
 }
 
-func (q *runnerQueue) acquire(ctx context.Context, runner string) (func(), error) {
+func (q *runnerQueue) acquire(ctx context.Context, runner string, prepareQueued func() error) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -30,22 +32,53 @@ func (q *runnerQueue) acquire(ctx context.Context, runner string) (func(), error
 	if !ok {
 		return nil, errRunnerQueueFull
 	}
+	release := func() {
+		if ready == nil {
+			q.release(runner)
+		} else {
+			q.leave(runner, ready)
+		}
+	}
+	acquired := false
+	defer func() {
+		if !acquired {
+			release()
+		}
+	}()
 	if ready != nil {
+		if prepareQueued != nil {
+			if err := prepareQueued(); err != nil {
+				return nil, err
+			}
+		}
 		select {
 		case <-ready:
 		case <-ctx.Done():
 		}
 	}
-	release := func() { q.release(runner) }
 	if err := ctx.Err(); err != nil {
-		if ready == nil {
-			release()
-		} else {
-			q.cancel(runner, ready)
-		}
 		return nil, err
 	}
+	acquired = true
 	return release, nil
+}
+
+func (q *runnerQueue) reserveArchive(size, limit int64) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stagedArchives >= maxBridgeWaiters || size > limit-q.stagedBytes {
+		return false
+	}
+	q.stagedArchives++
+	q.stagedBytes += size
+	return true
+}
+
+func (q *runnerQueue) releaseArchive(size int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.stagedArchives--
+	q.stagedBytes -= size
 }
 
 func (q *runnerQueue) tryAcquire(runner string) func() {
@@ -72,7 +105,7 @@ func (q *runnerQueue) admit(runner string, wait bool) (chan struct{}, bool) {
 	return ready, true
 }
 
-func (q *runnerQueue) cancel(runner string, ready chan struct{}) {
+func (q *runnerQueue) leave(runner string, ready chan struct{}) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	select {

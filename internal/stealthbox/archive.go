@@ -2,6 +2,7 @@ package stealthbox
 
 import (
 	"archive/tar"
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,10 +22,17 @@ func excluded(path string) bool {
 
 // Snapshot never dereferences symlinks or includes the usual secret/dependency directories.
 func Snapshot(root string, w io.Writer, max int64) error {
+	return snapshotContext(context.Background(), root, w, max)
+}
+
+func snapshotContext(ctx context.Context, root string, w io.Writer, max int64) error {
 	tw := tar.NewWriter(w)
 	var total int64
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rel, e := filepath.Rel(root, path)
@@ -69,14 +77,29 @@ func Snapshot(root string, w io.Writer, max int64) error {
 		if e != nil {
 			return e
 		}
-		_, e = io.CopyN(tw, f, info.Size())
+		_, e = io.CopyN(tw, snapshotReader{ctx, f}, info.Size())
 		f.Close()
 		return e
 	})
 	if err != nil {
 		return err
 	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	return tw.Close()
+}
+
+type snapshotReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r snapshotReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
 }
 
 // A stage directory receives only regular files/directories. Existing checkout is untouched until validation succeeds.
@@ -168,6 +191,13 @@ func validateRunnerRoot(root string) error {
 
 // SyncSnapshot preserves excluded paths, removes stale code, and never follows destination symlinks.
 func SyncSnapshot(root string, r io.Reader, max int64) error {
+	return syncSnapshot(context.Background(), root, r, max, false)
+}
+
+func syncSnapshot(ctx context.Context, root string, r io.Reader, max int64, readToEOF bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validateRunnerRoot(root); err != nil {
 		return err
 	}
@@ -180,8 +210,16 @@ func SyncSnapshot(root string, r io.Reader, max int64) error {
 		return err
 	}
 	defer os.RemoveAll(stage)
-	if err = extractArchive(r, stage, max); err != nil {
+	source := snapshotReader{ctx, r}
+	if err = extractArchive(source, stage, max); err != nil {
 		return err
+	}
+	if readToEOF {
+		// Tar can end before the HTTP body. Reach HTTP EOF for peer-close
+		// detection before altering the runner's snapshot.
+		if _, err = io.Copy(io.Discard, source); err != nil {
+			return err
+		}
 	}
 	// Move only excluded entries to the new snapshot. Everything else is disposable.
 	type moved struct{ old, new string }
@@ -189,6 +227,9 @@ func SyncSnapshot(root string, r io.Reader, max int64) error {
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, e error) error {
 		if e != nil {
 			return e
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		rel, e := filepath.Rel(root, path)
 		if e != nil {
@@ -211,6 +252,9 @@ func SyncSnapshot(root string, r io.Reader, max int64) error {
 		return nil
 	})
 	if err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
 		return err
 	}
 	restore := func() {

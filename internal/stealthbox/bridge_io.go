@@ -51,7 +51,9 @@ func (r bridgeArchiveReader) Read(p []byte) (int, error) {
 	}
 	deadline, _ := r.ctx.Deadline()
 	_ = r.control.SetReadDeadline(bridgeIODeadline(deadline))
-	return r.body.Read(p)
+	n, err := r.body.Read(p)
+	_ = r.control.SetReadDeadline(time.Time{})
+	return n, err
 }
 
 func bridgeIODeadline(deadline time.Time) time.Time {
