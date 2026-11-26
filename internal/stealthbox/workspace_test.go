@@ -3,6 +3,7 @@ package stealthbox
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,30 @@ func TestMCPExecutionAndBinding(t *testing.T) {
 		t.Fatal(e)
 	}
 	s := out.String()
+	var handshake struct {
+		Result struct{ ServerInfo struct{ Version string } }
+	}
+	decoder := json.NewDecoder(&out)
+	if err := decoder.Decode(&handshake); err != nil || handshake.Result.ServerInfo.Version != BuildVersion {
+		t.Fatalf("initialize returned version %q, want %q (decode error: %v)", handshake.Result.ServerInfo.Version, BuildVersion, err)
+	}
+	var catalog struct {
+		Result struct {
+			Tools []struct{ Name, Description string }
+		}
+	}
+	if err := decoder.Decode(&catalog); err != nil {
+		t.Fatal(err)
+	}
+	var runnerDescription string
+	for _, tool := range catalog.Result.Tools {
+		if tool.Name == "runner_run" {
+			runnerDescription = tool.Description
+		}
+	}
+	if !strings.Contains(runnerDescription, "cleans up its process group") {
+		t.Errorf("runner_run lacks process lifetime guidance: %s", runnerDescription)
+	}
 	if !strings.Contains(s, "mcp-ok") || !strings.Contains(s, "bound to project") || strings.Contains(s, `"name":"mac_exec"`) {
 		t.Fatal(s)
 	}

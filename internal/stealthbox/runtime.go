@@ -149,11 +149,14 @@ func Output(ctx context.Context, cmd Command) ([]byte, error) {
 	}
 	return out, err
 }
+
+const runnerLifetimeGuide = "runner_run is synchronous and cleans up its process group even after a successful exit. Run jobs in the foreground to receive their final status. For jobs that must outlive the call, use a dedicated tmux session on the runner and check the result separately."
+
 func Guide(project, runner string) string {
 	workloadGuide := " Run Docker, builds, test suites, dependency installation, full lint, and other heavy workloads only through the stealthbox runner_run MCP tool using the configured runner. " +
 		"Omit runner to use the session default. A local runner executes on the Mac in a separate checkout. " +
 		"If the configured runner is unavailable, report the blocker. Do not fall back to shell commands or switch to the VM. " +
-		"Do not automatically retry a command after disconnection without checking whether it ran."
+		"Do not automatically retry a command after disconnection without checking whether it ran. " + runnerLifetimeGuide
 	imageGuide := " View Mac terminal clipboard paths supplied by the user only through the stealthbox " +
 		readPastedImageTool + " MCP tool. Pass the exact absolute pasted-image-*.png path. If the bridge or file is unavailable, ask the user to paste or upload the image again."
 	if project == "" {

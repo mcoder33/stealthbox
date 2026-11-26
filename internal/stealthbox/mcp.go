@@ -119,7 +119,7 @@ func dispatchMCP(ctx context.Context, c Config, scope MCPScope, req mcpRequest, 
 		resp.Result = map[string]any{
 			"protocolVersion": protocol,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]string{"name": "stealthbox", "version": "0.3.0"},
+			"serverInfo":      map[string]string{"name": "stealthbox", "version": BuildVersion},
 			"instructions":    Guide(scope.Project, scope.Runner),
 		}
 	case "ping":
@@ -136,7 +136,7 @@ func dispatchMCP(ctx context.Context, c Config, scope MCPScope, req mcpRequest, 
 
 func mcpTools(c Config, scope MCPScope) any {
 	schema := map[string]any{"type": "object", "properties": map[string]any{"argv": map[string]any{"type": "array", "items": map[string]string{"type": "string"}, "minItems": 1}, "project": map[string]string{"type": "string", "description": "Legacy configured project name"}, "path": map[string]string{"type": "string", "description": "Workspace checkout path, absolute under VMRoot or relative to VMRoot; required per workspace call"}, "runner": map[string]any{"type": "string", "enum": []string{"vm", "local", "mac"}}, "cwd": map[string]string{"type": "string", "description": "Command directory relative to the selected checkout; selecting a subdirectory path syncs the whole checkout"}}, "required": []string{"argv"}, "additionalProperties": false}
-	tools := []map[string]any{{"name": "runner_run", "description": "The required tool for Docker, builds, test suites, dependency installation, full lint, and other heavy workloads. Omit runner to use the configured runner. If unavailable, report the blocker without a shell or VM fallback. Local runs synchronize uncommitted files, preserve dependency caches, and return stdout/stderr/exit status. Do not retry automatically after disconnection.", "inputSchema": schema}, {"name": "vm_exec", "description": "Execute an explicit command in the selected source checkout on the VM without synchronization. Use runner_run for heavy workloads.", "inputSchema": schema}}
+	tools := []map[string]any{{"name": "runner_run", "description": "The required tool for Docker, builds, test suites, dependency installation, full lint, and other heavy workloads. Omit runner to use the configured runner. If unavailable, report the blocker without a shell or VM fallback. Local runs synchronize uncommitted files, preserve dependency caches, and return stdout/stderr/exit status. Do not retry automatically after disconnection. " + runnerLifetimeGuide, "inputSchema": schema}, {"name": "vm_exec", "description": "Execute an explicit command in the selected source checkout on the VM without synchronization. Use runner_run for heavy workloads.", "inputSchema": schema}}
 	if scope.Workspace {
 		tools = append(tools, map[string]any{"name": "projects_list", "description": "Discover Git checkouts and worktrees under the configured VM workspace root. Each execution must supply its own path; repeated basenames are not identities.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}})
 	}
