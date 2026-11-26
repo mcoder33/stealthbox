@@ -77,10 +77,14 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	}
 	if args[0] == "serena-catalog" {
-		if len(args) != 2 {
-			return fmt.Errorf("usage: stealthbox serena-catalog /absolute/path/to/serena")
+		if len(args) != 2 && len(args) != 3 {
+			return fmt.Errorf("usage: stealthbox serena-catalog /absolute/path/to/serena [context]")
 		}
-		manifest, err := stealthbox.DiscoverSerena(ctx, args[1])
+		var toolContext string
+		if len(args) == 3 {
+			toolContext = args[2]
+		}
+		manifest, err := stealthbox.DiscoverSerena(ctx, args[1], toolContext)
 		if err != nil {
 			return err
 		}
@@ -433,6 +437,12 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("mcp-service is started by the managed agent launcher")
 		}
 		return stealthbox.ManagedMCPService(ctx, c, *config, f.Args()[0])
+	case "serena-stdio":
+		if *dry {
+			fmt.Println("Connect the stdio client to shared Serena")
+			return nil
+		}
+		return stealthbox.StandaloneSerena(ctx, c, *config)
 	case "agent-client":
 		if *dry || !visited["agent"] || !visited["runner"] || !visited["project"] {
 			return fmt.Errorf("agent-client is started by the managed workspace")
@@ -650,6 +660,7 @@ func usage() {
                                      Preview local → VM / VM → local transfer; source files stay unchanged
   stealthbox source apply --plan FILE Apply reviewed plan only if both sides are unchanged
   stealthbox mcp                      MCP stdio tools for manual integrations
+  stealthbox serena-stdio --config FILE   Connect a local MCP client to shared Serena
 
 All command flags precede -- and command arguments. --dry-run makes no changes.
 Config: STEALTHBOX_CONFIG or ~/.config/stealthbox/config.json.
