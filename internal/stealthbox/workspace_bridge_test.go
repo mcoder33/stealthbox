@@ -47,10 +47,13 @@ func TestWorkspaceBridgeRejectsUntrustedScopeAndPaths(t *testing.T) {
 	}
 }
 
-func TestWorkspaceBridgeLocksCheckoutAndAllowsOtherProject(t *testing.T) {
+func TestWorkspaceBridgeQueuesCheckoutAndAllowsOtherProject(t *testing.T) {
 	c := rootConfig(t)
 	c.Bridge.AllowExec = true
 	first := createCheckout(t, c, "a/api", "first")
+	if err := os.Mkdir(filepath.Join(first, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	second := createCheckout(t, c, "b/api", "second")
 	a, err := ResolveProject(context.Background(), c, first, "")
 	if err != nil {
@@ -60,9 +63,10 @@ func TestWorkspaceBridgeLocksCheckoutAndAllowsOtherProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := BridgeHandler(c)
+	queue := &runnerQueue{waiting: make(map[string][]chan struct{})}
+	handler := bridgeHandler(c, queue)
 	done := make(chan *httptest.ResponseRecorder, 1)
-	meta, _ := json.Marshal(RunRequest{WorkspaceID: c.Workspace.ID, Path: "a/api", Sync: true, Args: []string{"sh", "-c", "printf ready > started; while [ ! -f release ]; do sleep 0.01; done"}})
+	meta, _ := json.Marshal(RunRequest{WorkspaceID: c.Workspace.ID, Path: "a/api", Sync: true, Args: []string{"sh", "-c", "printf ready > started; while [ ! -f release ]; do sleep 0.01; done; printf released > state"}})
 	request := httptest.NewRequest("POST", "http://unix/run", snapshotFor(t, first))
 	request.Header.Set("Authorization", "Bearer "+c.Bridge.Token)
 	request.Header.Set("X-Stealthbox-Request", base64.RawURLEncoding.EncodeToString(meta))
@@ -78,10 +82,24 @@ func TestWorkspaceBridgeLocksCheckoutAndAllowsOtherProject(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	defer os.WriteFile(a.RunnerPath+"/release", nil, 0600)
-	same := requestBridge(t, handler, c, RunRequest{WorkspaceID: c.Workspace.ID, Path: "a/api", Args: []string{"true"}}, nil, c.Bridge.Token)
-	if same.Code != 409 {
-		t.Fatal(same.Code, same.Body.String())
-	}
+	queued := make(chan *httptest.ResponseRecorder, 1)
+	secondRequest := queueRunRequest(t, context.Background(), c, "http://unix", RunRequest{
+		WorkspaceID: c.Workspace.ID, Path: "a/api", CWD: "sub", Args: []string{"cat", "../state"},
+	})
+	go func() {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, secondRequest)
+		queued <- response
+	}()
+	waitForQueueTest(t, "second request to wait on the same checkout", func() bool {
+		select {
+		case response := <-queued:
+			t.Fatalf("same checkout responded before release: %d %s", response.Code, response.Body)
+		default:
+		}
+		_, waiting := queueDepth(queue, a.RunnerPath)
+		return waiting == 1
+	})
 	different := requestBridge(t, handler, c, RunRequest{WorkspaceID: c.Workspace.ID, Path: "b/api", Sync: true, Args: []string{"cat", "name"}}, snapshotFor(t, second), c.Bridge.Token)
 	if different.Code != 200 || !strings.Contains(different.Body.String(), "second") {
 		t.Fatal(different.Code, different.Body.String())
@@ -104,6 +122,14 @@ func TestWorkspaceBridgeLocksCheckoutAndAllowsOtherProject(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("first command remained blocked")
+	}
+	select {
+	case response := <-queued:
+		if response.Code != 200 || !strings.Contains(response.Body.String(), "released") {
+			t.Fatal(response.Code, response.Body.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("queued command did not run after release")
 	}
 	artifact := httptest.NewRecorder()
 	handler.ServeHTTP(artifact, fileRequest)

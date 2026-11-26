@@ -43,7 +43,9 @@ func TestRootAgentUsesExternalExecutableAndWorkspaceScope(t *testing.T) {
 	c.Agents["codex"] = []string{agent}
 	t.Setenv("STEALTHBOX_PROJECT", "stale-static-binding")
 	t.Setenv("STEALTHBOX_SCOPE", "static")
-	if err := LaunchAgent(context.Background(), c, "/tmp/config.json", c.Workspace.VMRoot, "codex", "vm", []string{"argument with spaces"}, &strings.Builder{}, &strings.Builder{}); err != nil {
+	configPath := filepath.Join(dir, "config.json")
+	seedManagedMCP(t, c, configPath)
+	if err := LaunchAgent(context.Background(), c, configPath, c.Workspace.VMRoot, "codex", "vm", []string{"argument with spaces"}, &strings.Builder{}, &strings.Builder{}); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(log)
@@ -51,7 +53,7 @@ func TestRootAgentUsesExternalExecutableAndWorkspaceScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	actual := string(b)
-	if strings.Count(actual, "workspace||") != 1 || !strings.Contains(actual, "mcp_servers.stealthbox.env.STEALTHBOX_SCOPE=\"workspace\"") || !strings.Contains(actual, "argument with spaces") {
+	if strings.Count(actual, "workspace||") != 1 || !strings.Contains(actual, "mcp_servers.stealthbox={url=\"http://127.0.0.1:") || !strings.Contains(actual, "argument with spaces") {
 		t.Fatal(actual)
 	}
 }
@@ -156,9 +158,7 @@ func TestRunningAgentRetainsCapturedRunnerAfterDefaultChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Agents["codex"] = []string{agent}
-	if err := Save(config, c); err != nil {
-		t.Fatal(err)
-	}
+	seedManagedMCP(t, c, config)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)

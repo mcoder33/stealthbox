@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -44,8 +43,7 @@ type Event struct {
 // between pipe reads is held back until complete, so it is not replaced by U+FFFD.
 type eventWriter struct {
 	mu      *sync.Mutex
-	enc     *json.Encoder
-	flush   http.Flusher
+	write   func(Event) error
 	stream  string
 	pending []byte
 }
@@ -78,11 +76,7 @@ func (w *eventWriter) Close() error {
 }
 
 func (w *eventWriter) emit(data []byte) error {
-	err := w.enc.Encode(Event{Stream: w.stream, Data: string(data)})
-	if w.flush != nil {
-		w.flush.Flush()
-	}
-	return err
+	return w.write(Event{Stream: w.stream, Data: string(data)})
 }
 
 // completeUTF8Prefix returns the length of b without a trailing incomplete UTF-8 sequence.
@@ -109,185 +103,281 @@ func limits(c Config) (int64, time.Duration) {
 	return m, time.Duration(s) * time.Second
 }
 func BridgeHandler(c Config) http.Handler {
-	locks := &runnerLocks{projects: map[string]*sync.Mutex{}}
+	return bridgeHandler(c, &runnerQueue{waiting: make(map[string][]chan struct{})})
+}
+
+func bridgeHandler(c Config, queue *runnerQueue) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		supplied := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if len(c.Bridge.Token) < 32 || subtle.ConstantTimeCompare([]byte(supplied), []byte(c.Bridge.Token)) != 1 {
 			http.Error(w, "unauthorized", 401)
 			return
 		}
-		if r.URL.Path == "/health" && r.Method == "GET" {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /health":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "allow_exec": c.Bridge.AllowExec, "config_hash": configHash(c)})
-			return
-		}
-		if r.URL.Path == pastedImageEndpoint && r.Method == http.MethodGet {
+		case "GET " + pastedImageEndpoint:
 			servePastedImage(w, r)
-			return
-		}
-		if r.URL.Path == "/file" && r.Method == "GET" {
-			serveFile(w, r, c, locks)
-			return
-		}
-		if r.URL.Path != "/run" || r.Method != "POST" {
+		case "GET /file":
+			serveFile(w, r, c, queue)
+		case "POST /run":
+			serveBridgeRun(w, r, c, queue)
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		raw, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Stealthbox-Request"))
-		if err != nil || len(raw) > 16384 {
-			http.Error(w, "invalid request", 400)
-			return
-		}
-		var req RunRequest
-		if err = json.Unmarshal(raw, &req); err != nil {
-			http.Error(w, "invalid request", 400)
-			return
-		}
-		if _, err := relativeCommandDirectory(req.CWD); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		_, operationTimeout := limits(c)
-		operationCtx, cancel := context.WithTimeout(r.Context(), operationTimeout)
-		defer cancel()
-		resolved, err := resolveBridgeProject(operationCtx, c, req)
-		if err != nil {
-			http.Error(w, err.Error(), 403)
-			return
-		}
-		p := resolved.Project
-		dst, ok := p.Runners["mac"]
-		if !ok || dst.Host != "" || dst.Bridge {
-			http.Error(w, "local runner is unavailable", 400)
-			return
-		}
-		if len(req.Args) == 0 || len(req.Args) > 256 {
-			http.Error(w, "missing or excessive command arguments", 400)
-			return
-		}
-		for _, a := range req.Args {
-			if strings.ContainsRune(a, 0) {
-				http.Error(w, "argument contains NUL", 400)
-				return
-			}
-		}
-		if !req.Sync && !c.Bridge.AllowExec {
-			http.Error(w, "direct Mac execution is disabled; enable allow_exec locally", 403)
-			return
-		}
-		lock := locks.forProject(resolved.ID)
-		if !lock.TryLock() {
-			http.Error(w, "another command is using this runner", 409)
-			return
-		}
-		defer lock.Unlock()
-		max, _ := limits(c)
-		syncStatus, syncTransport := "not-requested", ""
-		if req.Sync {
-			transport := req.Transport
-			if transport == "" {
-				transport = "archive"
-			}
-			if transport != "archive" && transport != "rsync" {
-				http.Error(w, "unsupported runner sync transport", 400)
-				return
-			}
-			if c.Workspace.SyncTransport == "rsync" && transport != "rsync" {
-				http.Error(w, "this local runner requires rsync transport", 400)
-				return
-			}
-			if transport == "rsync" {
-				var diagnostic strings.Builder
-				err = PullRunner(operationCtx, c, p.Source, dst.Path, &diagnostic)
-			} else {
-				err = SyncSnapshot(dst.Path, http.MaxBytesReader(w, r.Body, max+(64<<20)), max)
-			}
-			if err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-			syncStatus, syncTransport = "completed", transport
-		}
-
-		if !req.Sync {
-			if _, e := os.Stat(dst.Path); os.IsNotExist(e) {
-				if e = validateRunnerRoot(dst.Path); e != nil {
-					http.Error(w, e.Error(), 400)
-					return
-				}
-			}
-		}
-		root, err := filepath.EvalSymlinks(dst.Path)
-		if err != nil {
-			http.Error(w, "runner directory is unavailable", 400)
-			return
-		}
-		cwd := root
-		if resolved.RelativeCWD != "" {
-			if !filepath.IsLocal(resolved.RelativeCWD) {
-				http.Error(w, "cwd must stay inside runner directory", 400)
-				return
-			}
-			cwd, err = filepath.EvalSymlinks(filepath.Join(root, resolved.RelativeCWD))
-			if err != nil || !within(root, cwd) {
-				http.Error(w, "cwd is outside runner directory or unavailable", 400)
-				return
-			}
-		}
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.WriteHeader(200)
-		enc := json.NewEncoder(w)
-		mu := &sync.Mutex{}
-		flusher, _ := w.(http.Flusher)
-		if flusher != nil {
-			flusher.Flush()
-		}
-		cmd := exec.CommandContext(operationCtx, req.Args[0], req.Args[1:]...)
-		cmd.Dir = cwd
-		cmd.Env = append(os.Environ(), "STEALTHBOX_PROJECT="+resolved.DisplayName, "STEALTHBOX_RUNNER=local")
-		if resolved.StaticName == "" {
-			cmd.Env = append(cmd.Env, "COMPOSE_PROJECT_NAME="+resolved.ID)
-		}
-		stdout := &eventWriter{mu: mu, enc: enc, flush: flusher, stream: "stdout"}
-		stderr := &eventWriter{mu: mu, enc: enc, flush: flusher, stream: "stderr"}
-		cmd.Stdout = stdout
-		cmd.Stderr = stderr
-		if _, err := io.WriteString(cmd.Stderr, executionReceipt(resolved, "mac", cwd, syncStatus, syncTransport)); err != nil {
-			return
-		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Cancel = func() error {
-			if cmd.Process == nil {
-				return os.ErrProcessDone
-			}
-			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		cmd.WaitDelay = 2 * time.Second
-		code := 0
-		err = cmd.Run()
-		_ = stdout.Close()
-		_ = stderr.Close()
-		if err != nil {
-			code = 1
-			var ex *exec.ExitError
-			if errors.As(err, &ex) {
-				code = ex.ExitCode()
-				if code < 0 {
-					code = 130
-				}
-			}
-			mu.Lock()
-			_ = enc.Encode(Event{Stream: "stderr", Data: err.Error() + "\n"})
-			mu.Unlock()
-		}
-		mu.Lock()
-		_ = enc.Encode(Event{Stream: "exit", Code: code})
-		if flusher != nil {
-			flusher.Flush()
-		}
-		mu.Unlock()
 	})
 }
+
+func decodeBridgeRunRequest(encoded string) (RunRequest, error) {
+	var req RunRequest
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(raw) > 16384 {
+		return req, errors.New("invalid request")
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return req, errors.New("invalid request")
+	}
+	_, err = relativeCommandDirectory(req.CWD)
+	return req, err
+}
+
+func validateBridgeArgs(args []string) error {
+	if len(args) == 0 || len(args) > 256 {
+		return errors.New("missing or excessive command arguments")
+	}
+	for _, arg := range args {
+		if strings.ContainsRune(arg, 0) {
+			return errors.New("argument contains NUL")
+		}
+	}
+	return nil
+}
+
+func serveBridgeRun(w http.ResponseWriter, r *http.Request, c Config, queue *runnerQueue) {
+	req, err := decodeBridgeRunRequest(r.Header.Get("X-Stealthbox-Request"))
+	if err != nil {
+		writeBridgeRunError(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, operationTimeout := limits(c)
+	resolveCtx, finishResolution := context.WithTimeout(r.Context(), operationTimeout)
+	resolved, err := resolveBridgeProject(resolveCtx, c, req)
+	finishResolution()
+	if err != nil {
+		writeBridgeRunError(w, r, err.Error(), http.StatusForbidden)
+		return
+	}
+	dst, ok := resolved.Project.Runners["mac"]
+	if !ok || dst.Host != "" || dst.Bridge {
+		writeBridgeRunError(w, r, "local runner is unavailable", http.StatusBadRequest)
+		return
+	}
+	if err := validateBridgeArgs(req.Args); err != nil {
+		writeBridgeRunError(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !req.Sync && !c.Bridge.AllowExec {
+		writeBridgeRunError(w, r, "direct Mac execution is disabled; enable allow_exec locally", http.StatusForbidden)
+		return
+	}
+	transport, err := bridgeSyncTransport(c, req)
+	if err != nil {
+		writeBridgeRunError(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	runQueuedBridgeCommand(w, r, c, queue, req, resolved, dst, transport)
+}
+
+func runQueuedBridgeCommand(w http.ResponseWriter, r *http.Request, c Config, queue *runnerQueue, req RunRequest, resolved ResolvedProject, dst Endpoint, transport string) {
+	maxBytes, operationTimeout := limits(c)
+	var archive *queuedBridgeArchive
+	closeArchive := func() {
+		if archive != nil {
+			archive.close()
+			archive = nil
+		}
+	}
+	defer closeArchive()
+	waitCtx, finishWaiting := context.WithTimeout(r.Context(), operationTimeout)
+	defer finishWaiting()
+	release, err := queue.acquire(waitCtx, filepath.Clean(dst.Path), func() error {
+		if transport != "archive" {
+			return nil
+		}
+		var err error
+		archive, err = stageQueuedBridgeArchive(waitCtx, w, r, queue, maxBytes)
+		return err
+	})
+	finishWaiting()
+	if err != nil {
+		closeArchive()
+		writeRunnerQueueError(w, r, err)
+		return
+	}
+	defer release()
+
+	operationCtx, cancel := context.WithTimeout(r.Context(), operationTimeout)
+	defer cancel()
+	if err := operationCtx.Err(); err != nil {
+		closeArchive()
+		writeRunnerQueueError(w, r, err)
+		return
+	}
+	syncStatus := "not-requested"
+	if req.Sync {
+		err := syncBridgeRunner(operationCtx, w, r, c, resolved.Project.Source, dst, transport, archive, maxBytes)
+		closeArchive()
+		if err != nil {
+			writeBridgeRunError(w, r, err.Error(), http.StatusBadRequest)
+			return
+		}
+		syncStatus = "completed"
+	}
+	cwd, err := bridgeRunnerCWD(dst.Path, resolved.RelativeCWD, req.Sync)
+	if err != nil {
+		writeBridgeRunError(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	streamBridgeCommand(operationCtx, cancel, w, resolved, req.Args, cwd, syncStatus, transport)
+}
+
+func bridgeRunnerCWD(path, relativeCWD string, synced bool) (string, error) {
+	if !synced {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if err := validateRunnerRoot(path); err != nil {
+				return "", err
+			}
+		}
+	}
+	root, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", errors.New("runner directory is unavailable")
+	}
+	if relativeCWD == "" {
+		return root, nil
+	}
+	if !filepath.IsLocal(relativeCWD) {
+		return "", errors.New("cwd must stay inside runner directory")
+	}
+	cwd, err := filepath.EvalSymlinks(filepath.Join(root, relativeCWD))
+	if err != nil || !within(root, cwd) {
+		return "", errors.New("cwd is outside runner directory or unavailable")
+	}
+	return cwd, nil
+}
+
+func bridgeSyncTransport(c Config, req RunRequest) (string, error) {
+	if !req.Sync {
+		return "", nil
+	}
+	transport := req.Transport
+	if transport == "" {
+		transport = "archive"
+	}
+	if transport != "archive" && transport != "rsync" {
+		return "", errors.New("unsupported runner sync transport")
+	}
+	if c.Workspace.SyncTransport == "rsync" && transport != "rsync" {
+		return "", errors.New("this local runner requires rsync transport")
+	}
+	return transport, nil
+}
+
+func writeRunnerQueueError(w http.ResponseWriter, r *http.Request, err error) {
+	var sizeError *http.MaxBytesError
+	switch {
+	case errors.Is(err, errRunnerQueueFull), errors.Is(err, errBridgeArchiveStagingFull):
+		writeBridgeRunError(w, r, "execution=not_started: "+err.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, context.DeadlineExceeded):
+		writeBridgeRunError(w, r, "execution=not_started: runner queue wait expired", http.StatusRequestTimeout)
+	case errors.Is(err, context.Canceled):
+		writeBridgeRunError(w, r, "execution=not_started: runner request canceled", http.StatusRequestTimeout)
+	case errors.As(err, &sizeError):
+		writeBridgeRunError(w, r, "execution=not_started: queued archive exceeds limit", http.StatusRequestEntityTooLarge)
+	default:
+		writeBridgeRunError(w, r, "execution=not_started: "+err.Error(), http.StatusBadRequest)
+	}
+}
+
+func writeBridgeRunError(w http.ResponseWriter, r *http.Request, message string, status int) {
+	// An unread archive must not delay an error response while a client uploads.
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(bridgeIOIdleTimeout))
+	http.Error(w, message, status)
+}
+
+func syncBridgeRunner(ctx context.Context, w http.ResponseWriter, r *http.Request, c Config, src, dst Endpoint, transport string, archive *queuedBridgeArchive, maxBytes int64) error {
+	if transport == "rsync" {
+		var diagnostic strings.Builder
+		return PullRunner(ctx, c, src, dst.Path, &diagnostic)
+	}
+	if archive != nil {
+		return syncSnapshot(ctx, dst.Path, archive.file, maxBytes, false)
+	}
+	return syncSnapshot(ctx, dst.Path, bridgeArchiveRequest(ctx, w, r, archiveRequestLimit(maxBytes)), maxBytes, true)
+}
+
+func streamBridgeCommand(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, resolved ResolvedProject, argv []string, cwd, syncStatus, transport string) {
+	deadline, _ := ctx.Deadline()
+	// Allow a brief final write after the command times out.
+	response := newBridgeResponse(w, deadline.Add(time.Second))
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	if err := response.flush(); err != nil {
+		return
+	}
+	enc := json.NewEncoder(response)
+	var writeErr error
+	writeEvent := func(event Event) error {
+		if writeErr == nil {
+			writeErr = enc.Encode(event)
+			if writeErr == nil {
+				writeErr = response.flush()
+			}
+			if writeErr != nil {
+				cancel()
+			}
+		}
+		return writeErr
+	}
+	var mu sync.Mutex
+	stdout := &eventWriter{mu: &mu, write: writeEvent, stream: "stdout"}
+	stderr := &eventWriter{mu: &mu, write: writeEvent, stream: "stderr"}
+	if _, err := io.WriteString(stderr, executionReceipt(resolved, "mac", cwd, syncStatus, transport)); err != nil {
+		return
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), "STEALTHBOX_PROJECT="+resolved.DisplayName, "STEALTHBOX_RUNNER=local")
+	if resolved.StaticName == "" {
+		cmd.Env = append(cmd.Env, "COMPOSE_PROJECT_NAME="+resolved.ID)
+	}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	err := runTaskCommand(ctx, cmd)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	if err != nil {
+		_ = writeEvent(Event{Stream: "stderr", Data: err.Error() + "\n"})
+	}
+	_ = writeEvent(Event{Stream: "exit", Code: bridgeCommandExitCode(err)})
+}
+
+func bridgeCommandExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		if code := exit.ExitCode(); code >= 0 {
+			return code
+		}
+		return 130
+	}
+	return 1
+}
+
 func within(root, p string) bool {
 	rel, err := filepath.Rel(root, p)
 	return err == nil && (rel == "." || filepath.IsLocal(rel))
@@ -440,7 +530,7 @@ func RunBridge(ctx context.Context, c Config, name string, args []string, snapsh
 		}
 		defer os.Remove(archive.Name())
 		defer archive.Close()
-		if err = Snapshot(p.Source.Path, archive, max); err != nil {
+		if err = snapshotContext(ctx, p.Source.Path, archive, max); err != nil {
 			return err
 		}
 		if _, err = archive.Seek(0, 0); err != nil {
@@ -538,22 +628,6 @@ func configHash(c Config) string {
 	return fmt.Sprintf("%x", h)
 }
 
-// A dynamically discovered checkout has one lock shared by runs and artifacts.
-type runnerLocks struct {
-	mutex    sync.Mutex
-	projects map[string]*sync.Mutex
-}
-
-func (locks *runnerLocks) forProject(id string) *sync.Mutex {
-	locks.mutex.Lock()
-	defer locks.mutex.Unlock()
-	lock := locks.projects[id]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		locks.projects[id] = lock
-	}
-	return lock
-}
 func resolveBridgeProject(ctx context.Context, c Config, request RunRequest) (ResolvedProject, error) {
 	if request.Project != "" {
 		if _, ok := c.Projects[request.Project]; !ok {

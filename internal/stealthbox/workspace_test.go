@@ -73,12 +73,12 @@ func TestMCPExecutionAndBinding(t *testing.T) {
 func TestAgentMCPWiring(t *testing.T) {
 	c := bridgeConfig(t)
 	for _, a := range []string{"codex", "claude"} {
-		cmd, e := AgentCommand(c, "/home/user/config.json", "test", a, "mac", nil)
+		cmd, e := AgentCommand(c, testMCPURL, "test", a, "mac", nil)
 		if e != nil {
 			t.Fatal(e)
 		}
 		s := strings.Join(cmd, " ")
-		if !strings.Contains(s, "mcp") || !strings.Contains(s, "STEALTHBOX_PROJECT") || strings.Contains(s, c.Bridge.Token) {
+		if !strings.Contains(s, "http://127.0.0.1:") || !strings.Contains(s, "STEALTHBOX_MCP_BEARER_TOKEN") || strings.Contains(s, "stealthbox.command") || strings.Contains(s, c.Bridge.Token) {
 			t.Fatal(s)
 		}
 	}

@@ -12,21 +12,22 @@ import (
 )
 
 type WorkspaceConfig struct {
-	Runner           string    `json:"runner,omitempty"`
-	Prepare          *bool     `json:"prepare,omitempty"`
-	VMRoot           string    `json:"vm_root,omitempty"`
-	LocalRoot        string    `json:"local_root,omitempty"`
-	SourceExcludes   []string  `json:"source_excludes,omitempty"`
-	SourceSafeLinks  bool      `json:"source_safe_links,omitempty"`
-	RunnerRoot       string    `json:"runner_root,omitempty"`
-	ID               string    `json:"id,omitempty"`
-	ShellIntegration bool      `json:"shell_integration,omitempty"`
-	SyncTransport    string    `json:"sync_transport,omitempty"`
-	Host             string    `json:"host"`
-	RemoteDir        string    `json:"remote_dir"`
-	Name             string    `json:"name"`
-	Theme            string    `json:"theme,omitempty"`
-	Forwards         []Forward `json:"forwards,omitempty"`
+	Serena           *SerenaManifest `json:"serena,omitempty"`
+	Runner           string          `json:"runner,omitempty"`
+	Prepare          *bool           `json:"prepare,omitempty"`
+	VMRoot           string          `json:"vm_root,omitempty"`
+	LocalRoot        string          `json:"local_root,omitempty"`
+	SourceExcludes   []string        `json:"source_excludes,omitempty"`
+	SourceSafeLinks  bool            `json:"source_safe_links,omitempty"`
+	RunnerRoot       string          `json:"runner_root,omitempty"`
+	ID               string          `json:"id,omitempty"`
+	ShellIntegration bool            `json:"shell_integration,omitempty"`
+	SyncTransport    string          `json:"sync_transport,omitempty"`
+	Host             string          `json:"host"`
+	RemoteDir        string          `json:"remote_dir"`
+	Name             string          `json:"name"`
+	Theme            string          `json:"theme,omitempty"`
+	Forwards         []Forward       `json:"forwards,omitempty"`
 }
 
 // WorkspaceRunner is a default for commands, never an identity of a tmux session.
@@ -74,6 +75,11 @@ func standardAgents() map[string][]string {
 	return map[string][]string{"codex": {"codex"}, "claude": {"claude"}, "shell": {"sh", "-c", "exec \"${SHELL:-/bin/sh}\" -l"}}
 }
 func (c Config) Validate() error {
+	if c.Workspace.Serena != nil {
+		if err := c.Workspace.Serena.validate(); err != nil {
+			return err
+		}
+	}
 	if _, err := canonicalSourceExcludes(c.Workspace.SourceExcludes); err != nil {
 		return err
 	}

@@ -51,7 +51,7 @@ func TestNativeAgentUtilityCommands(t *testing.T) {
 				t.Fatalf("utility %s: %q, %v", name, argv, err)
 			}
 		}
-		argv, err := AgentCommand(c, "/private/config.json", "", name, "vm", []string{"resume"})
+		argv, err := AgentCommand(c, testMCPURL, "", name, "vm", []string{"resume"})
 		if err != nil || !strings.Contains(strings.Join(argv, " "), "mcp") {
 			t.Fatal("interactive resume lost runner tools", err)
 		}

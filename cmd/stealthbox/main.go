@@ -76,6 +76,16 @@ func run(ctx context.Context, args []string) error {
 		fmt.Println("stealthbox", stealthbox.BuildVersion)
 		return nil
 	}
+	if args[0] == "serena-catalog" {
+		if len(args) != 2 {
+			return fmt.Errorf("usage: stealthbox serena-catalog /absolute/path/to/serena")
+		}
+		manifest, err := stealthbox.DiscoverSerena(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(manifest)
+	}
 	if args[0] == "handshake" {
 		fmt.Println(stealthbox.Handshake())
 		return nil
@@ -137,6 +147,7 @@ func run(ctx context.Context, args []string) error {
 	reconnect := f.Bool("reconnect", true, "reconnect after SSH transport failure")
 	artifact := f.String("file", "", "artifact path relative to Mac runner")
 	output := f.String("output", "", "local output file (must not exist)")
+	serenaManifest := f.String("serena-manifest", "", "VM Serena tool catalog JSON (config only; use off to disable)")
 	edit := f.Bool("edit", false, "edit config with EDITOR")
 	if err = f.Parse(parseArgs); err != nil {
 		return err
@@ -216,6 +227,21 @@ func run(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "config":
+		if visited["serena-manifest"] {
+			if *serenaManifest == "off" {
+				c.Workspace.Serena = nil
+			} else {
+				data, err := os.ReadFile(*serenaManifest)
+				if err != nil {
+					return err
+				}
+				var manifest stealthbox.SerenaManifest
+				if err = json.Unmarshal(data, &manifest); err != nil {
+					return err
+				}
+				c.Workspace.Serena = &manifest
+			}
+		}
 		if *edit {
 			if *dry {
 				return fmt.Errorf("--dry-run cannot edit config")
@@ -234,7 +260,7 @@ func run(ctx context.Context, args []string) error {
 			_, err = stealthbox.Load(*config)
 			return err
 		}
-		changed := false
+		changed := visited["serena-manifest"]
 		for _, name := range []string{"host", "remote-dir", "vm-root", "local-root", "runner-root", "sync-transport", "shell-integration", "runner"} {
 			changed = changed || visited[name]
 		}
@@ -402,6 +428,16 @@ func run(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("Local Mac bridge daemon: healthy; direct execution=%t. VM connectivity was not checked.\n", s.AllowExec)
 		return nil
+	case "mcp-service":
+		if *dry || len(f.Args()) != 1 {
+			return fmt.Errorf("mcp-service is started by the managed agent launcher")
+		}
+		return stealthbox.ManagedMCPService(ctx, c, *config, f.Args()[0])
+	case "agent-client":
+		if *dry || !visited["agent"] || !visited["runner"] || !visited["project"] {
+			return fmt.Errorf("agent-client is started by the managed workspace")
+		}
+		return stealthbox.ExecManagedAgent(ctx, c, *config, *project, *agent, *runner, f.Args())
 	case "mcp":
 		if *dry {
 			fmt.Println("Would start MCP stdio server")
@@ -587,6 +623,8 @@ func usage() {
   stealthbox connect --direct        macOS: reach the SSH first hop over the physical LAN
   stealthbox settings [--config PATH] Optional settings and diagnostics (alias: tui)
   stealthbox init --host dev-vm [--runner local|vm] [--allow-mac-exec]
+  stealthbox serena-catalog /absolute/path/to/serena   Print the installed Serena tool catalog on the VM
+  stealthbox config --serena-manifest FILE|off        Enable or disable shared worktree Serena
   stealthbox config --vm-root '~/Projects' --local-root ~/Projects --runner-root ~/.local/share/stealthbox/runners --shell-integration
   stealthbox project --project NAME --path /home/user/project --mac-path /Users/user/runner
   stealthbox setup --host dev-vm [--runner local|vm] [--binary PATH]
@@ -611,7 +649,7 @@ func usage() {
 ` + sessionUsage + `  stealthbox source import|export --path REL --plan FILE [--delete]
                                      Preview local → VM / VM → local transfer; source files stay unchanged
   stealthbox source apply --plan FILE Apply reviewed plan only if both sides are unchanged
-  stealthbox mcp                      MCP stdio tools (used automatically by Codex/Claude)
+  stealthbox mcp                      MCP stdio tools for manual integrations
 
 All command flags precede -- and command arguments. --dry-run makes no changes.
 Config: STEALTHBOX_CONFIG or ~/.config/stealthbox/config.json.
