@@ -45,6 +45,7 @@ type mcpHTTPSession struct {
 }
 
 type mcpHTTPServer struct {
+	serena    *serenaPool
 	config    Config
 	key       []byte
 	host      string
@@ -81,6 +82,14 @@ func ServeMCPHTTP(ctx context.Context, c Config, listener net.Listener, key []by
 		reading:   make(chan struct{}, mcpHTTPMaxReads),
 		executing: make(chan struct{}, mcpHTTPMaxCalls),
 		active:    make(map[mcpCallKey]context.CancelCauseFunc),
+	}
+	if c.Workspace.Serena != nil {
+		pool, err := newSerenaPool(c.Workspace.Serena, serenaIdleTimeout)
+		if err != nil {
+			return err
+		}
+		handler.serena = pool
+		defer handler.serena.close()
 	}
 	server := &http.Server{
 		Handler:           handler,
@@ -143,7 +152,10 @@ func (s *mcpHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		mcpHTTPUnauthorized(w)
 		return
 	}
-	if r.URL.Path != mcpHTTPPath {
+	if r.URL.Path == "/serena" && s.serena != nil {
+		client.serena = true
+		client.ID += "/serena"
+	} else if r.URL.Path != mcpHTTPPath {
 		http.NotFound(w, r)
 		return
 	}
@@ -266,11 +278,15 @@ func (s *mcpHTTPServer) dispatch(w http.ResponseWriter, ctx context.Context, cli
 		http.Error(w, "invalid MCP request ID", http.StatusBadRequest)
 		return
 	}
+	if client.serena && req.Method == "tools/list" {
+		writeMCPHTTPResponse(w, mcpResponse{JSONRPC: "2.0", ID: req.ID, Result: s.serena.inventory(client.Workspace)})
+		return
+	}
 	if req.Method != "tools/call" {
 		writeMCPHTTPResponse(w, dispatchMCP(ctx, s.config, client.MCPScope, req, session.protocol, 0))
 		return
 	}
-	s.callTool(w, ctx, client.MCPScope, mcpCallKey{session: session.id, request: id}, req)
+	s.callTool(w, ctx, client, mcpCallKey{session: session.id, request: id}, req)
 }
 
 func (s *mcpHTTPServer) initialize(w http.ResponseWriter, ctx context.Context, client mcpHTTPClient, req mcpRequest, id string) {
@@ -280,7 +296,13 @@ func (s *mcpHTTPServer) initialize(w http.ResponseWriter, ctx context.Context, c
 	}
 	protocol := mcpProtocol(req.Params, mcpHTTPProtocol)
 	w.Header().Set(mcpSessionHeader, s.mintSession(client, protocol))
-	writeMCPHTTPResponse(w, dispatchMCP(ctx, s.config, client.MCPScope, req, protocol, 0))
+	response := dispatchMCP(ctx, s.config, client.MCPScope, req, protocol, 0)
+	if client.serena {
+		result := response.Result.(map[string]any)
+		result["serverInfo"] = map[string]string{"name": "serena", "version": BuildVersion}
+		result["instructions"] = "Serena is pinned to each VM checkout. In workspace scope pass worktree on each tool call. Use initial_instructions for the selected worktree."
+	}
+	writeMCPHTTPResponse(w, response)
 }
 
 func mcpHTTPSupports(protocol string) bool {
@@ -366,7 +388,7 @@ func (s *mcpHTTPServer) notify(session string, req mcpRequest) {
 	}
 }
 
-func (s *mcpHTTPServer) callTool(w http.ResponseWriter, ctx context.Context, scope MCPScope, key mcpCallKey, req mcpRequest) {
+func (s *mcpHTTPServer) callTool(w http.ResponseWriter, ctx context.Context, client mcpHTTPClient, key mcpCallKey, req mcpRequest) {
 	select {
 	case s.executing <- struct{}{}:
 		defer func() { <-s.executing }()
@@ -400,7 +422,16 @@ func (s *mcpHTTPServer) callTool(w http.ResponseWriter, ctx context.Context, sco
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	response := dispatchMCP(ctx, s.config, scope, req, "", mcpHTTPBridgeTimeout(s.config))
+	var response mcpResponse
+	if client.serena {
+		result, err := s.serena.call(ctx, s.config, client.MCPScope, req.Params)
+		response = mcpResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+		if err != nil {
+			response.Result = map[string]any{"isError": true, "content": []map[string]string{{"type": "text", "text": err.Error()}}}
+		}
+	} else {
+		response = dispatchMCP(ctx, s.config, client.MCPScope, req, "", mcpHTTPBridgeTimeout(s.config))
+	}
 	if errors.Is(context.Cause(ctx), errMCPCancelledByClient) {
 		w.WriteHeader(http.StatusAccepted)
 		return

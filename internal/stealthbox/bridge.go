@@ -355,7 +355,7 @@ func streamBridgeCommand(ctx context.Context, cancel context.CancelFunc, w http.
 		cmd.Env = append(cmd.Env, "COMPOSE_PROJECT_NAME="+resolved.ID)
 	}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	err := runNoninteractiveCommand(ctx, cmd)
+	err := runTaskCommand(ctx, cmd)
 	_ = stdout.Close()
 	_ = stderr.Close()
 	if err != nil {

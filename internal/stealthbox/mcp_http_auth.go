@@ -22,6 +22,7 @@ const (
 )
 
 type mcpHTTPClient struct {
+	serena bool
 	MCPScope
 	ID string `json:"id"`
 }

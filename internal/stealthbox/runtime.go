@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -41,10 +42,18 @@ func runNoninteractiveCommand(ctx context.Context, cmd *exec.Cmd) error {
 	}
 	cmd.WaitDelay = 2 * time.Second
 	err := cmd.Run()
-	// The context watcher may stop when the leader exits, before inherited
-	// pipes close. WaitDelay only closes those pipes and can be hidden by an
-	// ExitError, so clean up the remaining group on every failed execution.
+	// A failed leader can leave descendants holding its pipes.
 	if cmd.Process != nil && (ctx.Err() != nil || err != nil) {
+		_ = cmd.Cancel()
+	}
+	return err
+}
+
+// Synchronous runner tools own their background children even when the leader
+// exits successfully and none of its children keeps an output pipe open.
+func runTaskCommand(ctx context.Context, cmd *exec.Cmd) error {
+	err := runNoninteractiveCommand(ctx, cmd)
+	if err == nil && cmd.Process != nil {
 		_ = cmd.Cancel()
 	}
 	return err
@@ -110,7 +119,11 @@ func Run(ctx context.Context, c Config, name, runner string, args []string, snap
 				return err
 			}
 		}
-		return ExecuteNoninteractiveContext(ctx, At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false), nil, stdout, stderr)
+		command := At(dst, "cd "+Quote(commandDirectory)+" && "+commandArgs, false)
+		cmd := exec.CommandContext(ctx, command.Program, command.Args...)
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		return runTaskCommand(ctx, cmd)
 	}
 	if !snapshot || (p.Source.Host == dst.Host && filepath.Clean(p.Source.Path) == filepath.Clean(dst.Path)) {
 		return execute()
@@ -171,6 +184,9 @@ func AgentCommand(c Config, mcpURL, project, agent, runner string, extra []strin
 		server := fmt.Sprintf(`mcp_servers.stealthbox={url=%s,bearer_token_env_var=%s,tool_timeout_sec=%d}`,
 			JSONString(mcpURL), JSONString(managedMCPTokenEnv), timeout/time.Second)
 		args = append(args, "-c", server)
+		if c.Workspace.Serena != nil {
+			args = append(args, "-c", fmt.Sprintf(`mcp_servers.serena={url=%s,bearer_token_env_var=%s,tool_timeout_sec=%d}`, JSONString(strings.TrimSuffix(mcpURL, "/mcp")+"/serena"), JSONString(managedMCPTokenEnv), timeout/time.Second))
+		}
 	case "claude":
 		timeoutMS := timeout.Milliseconds()
 		if configured, err := strconv.ParseInt(os.Getenv("MCP_TOOL_TIMEOUT"), 10, 64); err == nil && configured > 0 {
@@ -179,8 +195,12 @@ func AgentCommand(c Config, mcpURL, project, agent, runner string, extra []strin
 		server := map[string]any{"type": "http", "url": mcpURL, "timeout": timeoutMS, "headers": map[string]string{
 			"Authorization": "Bearer ${" + managedMCPTokenEnv + "}",
 		}}
+		servers := map[string]any{"stealthbox": server}
+		if c.Workspace.Serena != nil {
+			servers["serena"] = map[string]any{"type": "http", "url": strings.TrimSuffix(mcpURL, "/mcp") + "/serena", "timeout": timeoutMS, "headers": server["headers"]}
+		}
 		args = append(args, "--append-system-prompt", Guide(project, runner), "--mcp-config",
-			JSONString(map[string]any{"mcpServers": map[string]any{"stealthbox": server}}))
+			JSONString(map[string]any{"mcpServers": servers}))
 	}
 	return append(args, extra...), nil
 }
