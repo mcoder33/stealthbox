@@ -219,7 +219,7 @@ func TestInstalledSerenaWithTwoGitWorktrees(t *testing.T) {
 	write(filepath.Join(b, "fixture.py"), "def Beta():\n    return 2\n")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	m, err := DiscoverSerena(ctx, exe)
+	m, err := DiscoverSerena(ctx, exe, "")
 	if err != nil {
 		t.Fatal(err)
 	}

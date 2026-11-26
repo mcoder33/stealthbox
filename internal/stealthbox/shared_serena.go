@@ -20,6 +20,7 @@ import (
 // SerenaManifest is captured from the VM installation once at setup time.
 // MCP discovery in each new chat only reads these native tool schemas.
 type SerenaManifest struct {
+	Context string            `json:"context,omitempty"`
 	Command string            `json:"command"`
 	Tools   []json.RawMessage `json:"tools"`
 }
@@ -29,6 +30,7 @@ func worktreeTool(name string) bool {
 	case "initial_instructions", "onboarding", "check_onboarding_performed", "get_current_config",
 		"find_symbol", "find_referencing_symbols", "get_symbols_overview", "find_implementations",
 		"find_declaration", "get_diagnostics_for_file", "get_diagnostics_for_symbol",
+		"safe_delete_symbol", "search_for_pattern", "replace_in_files",
 		"rename_symbol", "replace_symbol_body", "insert_before_symbol", "insert_after_symbol", "replace_content",
 		"read_memory", "list_memories", "write_memory", "edit_memory", "delete_memory", "rename_memory":
 		return true
@@ -107,8 +109,11 @@ func (t *serenaTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 	return t.connection, nil
 }
 
-func openSerena(ctx context.Context, executable, cwd string, pinned bool) (*mcp.ClientSession, error) {
-	args := []string{"start-mcp-server", "--context", "claude-code", "--enable-web-dashboard", "false", "--open-web-dashboard", "false"}
+func openSerena(ctx context.Context, executable, cwd, toolContext string, pinned bool) (*mcp.ClientSession, error) {
+	if toolContext == "" {
+		toolContext = "claude-code"
+	}
+	args := []string{"start-mcp-server", "--context", toolContext, "--enable-web-dashboard", "false", "--open-web-dashboard", "false"}
 	if pinned {
 		args = append(args, "--project", cwd)
 	}
@@ -128,7 +133,7 @@ func openSerena(ctx context.Context, executable, cwd string, pinned bool) (*mcp.
 	return session, nil
 }
 
-func DiscoverSerena(ctx context.Context, executable string) (*SerenaManifest, error) {
+func DiscoverSerena(ctx context.Context, executable, toolContext string) (*SerenaManifest, error) {
 	if !filepath.IsAbs(executable) {
 		return nil, errors.New("provide an absolute path to the VM Serena executable")
 	}
@@ -139,12 +144,12 @@ func DiscoverSerena(ctx context.Context, executable string) (*SerenaManifest, er
 	defer os.RemoveAll(dir)
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	worker, err := openSerena(ctx, executable, dir, false)
+	worker, err := openSerena(ctx, executable, dir, toolContext, false)
 	if err != nil {
 		return nil, err
 	}
 	defer worker.Close()
-	m := &SerenaManifest{Command: executable}
+	m := &SerenaManifest{Command: executable, Context: toolContext}
 	for tool, err := range worker.Tools(ctx, nil) {
 		if err != nil {
 			return nil, err
@@ -325,10 +330,10 @@ func (p *serenaPool) call(ctx context.Context, c Config, scope MCPScope, params 
 	if err != nil {
 		return nil, err
 	}
-	return p.callInWorktree(ctx, root, c.Workspace.Serena.Command, &mcp.CallToolParams{Name: request.Name, Arguments: request.Arguments})
+	return p.callInWorktree(ctx, root, c.Workspace.Serena, &mcp.CallToolParams{Name: request.Name, Arguments: request.Arguments})
 }
 
-func (p *serenaPool) callInWorktree(ctx context.Context, root, executable string, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
+func (p *serenaPool) callInWorktree(ctx context.Context, root string, manifest *SerenaManifest, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
 	e, err := p.acquire(ctx, root)
 	if err != nil {
 		return nil, err
@@ -338,7 +343,7 @@ func (p *serenaPool) callInWorktree(ctx context.Context, root, executable string
 		return nil, err
 	}
 	if e.worker == nil {
-		e.worker, err = p.start(ctx, executable, root)
+		e.worker, err = p.start(ctx, manifest, root)
 		if err != nil {
 			return nil, err
 		}
@@ -353,14 +358,14 @@ func (p *serenaPool) callInWorktree(ctx context.Context, root, executable string
 
 // On startup Serena may register a new checkout in its user-level YAML.
 // Serialize this operation; ready workers in other checkouts remain usable.
-func (p *serenaPool) start(ctx context.Context, executable, root string) (*mcp.ClientSession, error) {
+func (p *serenaPool) start(ctx context.Context, manifest *SerenaManifest, root string) (*mcp.ClientSession, error) {
 	select {
 	case p.starting <- struct{}{}:
 		defer func() { <-p.starting }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return openSerena(ctx, executable, root, true)
+	return openSerena(ctx, manifest.Command, root, manifest.Context, true)
 }
 
 func serenaRoot(ctx context.Context, c Config, scope MCPScope, path string) (string, error) {
