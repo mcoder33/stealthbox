@@ -40,6 +40,7 @@ func TestAgentStartupGuide(t *testing.T) {
 				for _, want := range []string{
 					"default runner=local",
 					"only through the stealthbox runner_run MCP tool",
+					"cleans up its process group",
 					"Docker, builds, test suites, dependency installation, full lint",
 					"Do not fall back to shell commands or switch to the VM",
 					"only through the stealthbox read_pasted_image MCP tool",
