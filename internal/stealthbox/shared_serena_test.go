@@ -385,3 +385,57 @@ func TestManagedClientsSelectSharedSerenaOnlyWhenConfigured(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedSerenaCancellationReapsWorker(t *testing.T) {
+	c := rootConfig(t)
+	a := createCheckout(t, c, "a", "a")
+	c.Workspace.Serena = serenaFixtureManifest(fixtureSerena(t))
+	p, err := newSerenaPool(c.Workspace.Serena, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.call(ctx, c, MCPScope{Workspace: true, Runner: "vm"}, serenaToolRequest("a", "find_symbol", map[string]any{"delay": 20}))
+		done <- err
+	}()
+	pid := waitForMCPHTTPProcess(t, filepath.Join(a, "starts"))
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("canceled tool reported success")
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("worker still owns canceled call")
+	}
+	if syscall.Kill(pid, 0) != syscall.ESRCH {
+		t.Fatal("canceled worker still exists", pid)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.entries) != 0 {
+		t.Fatal("failed worker kept its worktree slot")
+	}
+}
+
+func TestSharedSerenaRejectsInvalidCatalog(t *testing.T) {
+	for _, raw := range []string{
+		`{"name":"activate_project","inputSchema":{"type":"object","properties":{}}}`,
+		`{"name":"find_symbol","inputSchema":{"type":"object","properties":{"worktree":{}}}}`,
+		`{"name":"find_symbol","inputSchema":null}`,
+	} {
+		m := SerenaManifest{Command: "/bin/false", Tools: []json.RawMessage{json.RawMessage(raw)}}
+		if _, err := newSerenaPool(&m, time.Second); err == nil {
+			t.Fatal("accepted", raw)
+		}
+	}
+	m := serenaFixtureManifest("/bin/false")
+	m.Tools = append(m.Tools, m.Tools[0])
+	if m.validate() == nil {
+		t.Fatal("accepted duplicate")
+	}
+}

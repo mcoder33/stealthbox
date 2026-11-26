@@ -42,30 +42,44 @@ func (m *SerenaManifest) catalog(workspace bool) (map[string]json.RawMessage, er
 	}
 	tools := make(map[string]json.RawMessage, len(m.Tools))
 	for _, raw := range m.Tools {
-		var tool map[string]any
-		if err := json.Unmarshal(raw, &tool); err != nil {
+		name, schema, err := serenaToolSchema(raw, workspace)
+		if err != nil {
 			return nil, err
 		}
-		name, _ := tool["name"].(string)
-		schema, _ := tool["inputSchema"].(map[string]any)
-		properties, _ := schema["properties"].(map[string]any)
-		if !worktreeTool(name) || tools[name] != nil || schema["type"] != "object" || properties == nil {
-			return nil, errors.New("invalid shared Serena tool catalog")
+		if tools[name] != nil {
+			return nil, fmt.Errorf("duplicate shared Serena tool %s", name)
 		}
-		if _, exists := properties["worktree"]; exists {
-			return nil, errors.New("Serena schema already defines worktree")
-		}
-		if workspace {
-			properties["worktree"] = map[string]string{"type": "string", "description": "VM checkout path under the workspace root; pass the same path for all operations on this worktree."}
-			required, _ := schema["required"].([]any)
-			schema["required"] = append(required, "worktree")
-			raw, _ = json.Marshal(tool)
-		}
-		tools[name] = raw
+		tools[name] = schema
 	}
 	return tools, nil
 }
-func (m *SerenaManifest) validate() error { _, err := m.catalog(false); return err }
+func serenaToolSchema(raw json.RawMessage, workspace bool) (string, json.RawMessage, error) {
+	var tool map[string]any
+	if err := json.Unmarshal(raw, &tool); err != nil {
+		return "", nil, err
+	}
+	name, _ := tool["name"].(string)
+	schema, _ := tool["inputSchema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	if !worktreeTool(name) || schema["type"] != "object" || properties == nil {
+		return "", nil, errors.New("invalid shared Serena tool catalog")
+	}
+	if _, exists := properties["worktree"]; exists {
+		return "", nil, errors.New("Serena schema already defines worktree")
+	}
+	if workspace {
+		properties["worktree"] = map[string]string{"type": "string", "description": "VM checkout path under the workspace root; pass the same path for all operations on this worktree."}
+		required, _ := schema["required"].([]any)
+		schema["required"] = append(required, "worktree")
+		raw, _ = json.Marshal(tool)
+	}
+	return name, raw, nil
+}
+
+func (m *SerenaManifest) validate() error {
+	_, err := m.catalog(false)
+	return err
+}
 
 // Close the complete process group exactly once when the SDK tears down its
 // connection, including failed initialization and an unexpected server exit.
@@ -190,34 +204,18 @@ func (p *serenaPool) inventory(workspace bool) any {
 }
 func (p *serenaPool) acquire(ctx context.Context, root string) (*serenaEntry, error) {
 	for {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return nil, errors.New("Serena service is stopping")
+		e, stopped, err := p.reserve(root)
+		if err != nil {
+			return nil, err
 		}
-		e := p.entries[root]
-		if e == nil {
-			if len(p.entries) >= maxSerenaWorktrees {
-				p.mu.Unlock()
-				return nil, errors.New("shared Serena worktree capacity exhausted")
-			}
-			e = &serenaEntry{gate: make(chan struct{}, 1)}
-			p.entries[root] = e
-		}
-		if done := e.stopping; done != nil {
-			p.mu.Unlock()
+		if stopped != nil {
 			select {
-			case <-done:
+			case <-stopped:
 				continue
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
 		}
-		e.refs++
-		if e.timer != nil {
-			e.timer.Stop()
-		}
-		p.mu.Unlock()
 		select {
 		case e.gate <- struct{}{}:
 			return e, nil
@@ -227,6 +225,30 @@ func (p *serenaPool) acquire(ctx context.Context, root string) (*serenaEntry, er
 		}
 	}
 }
+func (p *serenaPool) reserve(root string) (*serenaEntry, <-chan struct{}, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, nil, errors.New("Serena service is stopping")
+	}
+	e := p.entries[root]
+	if e == nil {
+		if len(p.entries) >= maxSerenaWorktrees {
+			return nil, nil, errors.New("shared Serena worktree capacity exhausted")
+		}
+		e = &serenaEntry{gate: make(chan struct{}, 1)}
+		p.entries[root] = e
+	}
+	if e.stopping != nil {
+		return nil, e.stopping, nil
+	}
+	e.refs++
+	if e.timer != nil {
+		e.timer.Stop()
+	}
+	return e, nil, nil
+}
+
 func (p *serenaPool) release(root string, e *serenaEntry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -299,24 +321,14 @@ func (p *serenaPool) call(ctx context.Context, c Config, scope MCPScope, params 
 		}
 		delete(request.Arguments, "worktree")
 	}
-	selector, err := scope.selector(c, "", path)
+	root, err := serenaRoot(ctx, c, scope, path)
 	if err != nil {
 		return nil, err
 	}
-	project, err := ResolveProject(ctx, c, selector, "")
-	if err != nil {
-		return nil, err
-	}
-	if project.Project.Source.Host != "" {
-		return nil, errors.New("Serena requires a checkout local to the VM")
-	}
-	root, err := filepath.EvalSymlinks(project.SourcePath)
-	if err != nil {
-		return nil, err
-	}
-	if marker, err := os.Stat(filepath.Join(root, ".git")); err != nil || (!marker.IsDir() && !marker.Mode().IsRegular()) {
-		return nil, fmt.Errorf("shared Serena requires a Git checkout or worktree root: %s", root)
-	}
+	return p.callInWorktree(ctx, root, c.Workspace.Serena.Command, &mcp.CallToolParams{Name: request.Name, Arguments: request.Arguments})
+}
+
+func (p *serenaPool) callInWorktree(ctx context.Context, root, executable string, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
 	e, err := p.acquire(ctx, root)
 	if err != nil {
 		return nil, err
@@ -326,12 +338,12 @@ func (p *serenaPool) call(ctx context.Context, c Config, scope MCPScope, params 
 		return nil, err
 	}
 	if e.worker == nil {
-		e.worker, err = p.start(ctx, c.Workspace.Serena.Command, root)
+		e.worker, err = p.start(ctx, executable, root)
 		if err != nil {
 			return nil, err
 		}
 	}
-	result, err := e.worker.CallTool(ctx, &mcp.CallToolParams{Name: request.Name, Arguments: request.Arguments})
+	result, err := e.worker.CallTool(ctx, params)
 	if err != nil {
 		e.worker.Close()
 		e.worker = nil
@@ -349,4 +361,26 @@ func (p *serenaPool) start(ctx context.Context, executable, root string) (*mcp.C
 		return nil, ctx.Err()
 	}
 	return openSerena(ctx, executable, root, true)
+}
+
+func serenaRoot(ctx context.Context, c Config, scope MCPScope, path string) (string, error) {
+	selector, err := scope.selector(c, "", path)
+	if err != nil {
+		return "", err
+	}
+	project, err := ResolveProject(ctx, c, selector, "")
+	if err != nil {
+		return "", err
+	}
+	if project.Project.Source.Host != "" {
+		return "", errors.New("Serena requires a checkout local to the VM")
+	}
+	root, err := filepath.EvalSymlinks(project.SourcePath)
+	if err != nil {
+		return "", err
+	}
+	if marker, err := os.Stat(filepath.Join(root, ".git")); err != nil || (!marker.IsDir() && !marker.Mode().IsRegular()) {
+		return "", fmt.Errorf("shared Serena requires a Git checkout or worktree root: %s", root)
+	}
+	return root, nil
 }
